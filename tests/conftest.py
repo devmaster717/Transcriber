@@ -7,7 +7,7 @@ import pytest
 
 from transcriber.core.app import TranscriberCore
 
-from .fakes import FakeTranscriptionGateway
+from .fakes import FakeAudioCapture, FakeTranscriptionGateway
 
 FIXED_NOW = datetime(2026, 9, 30, 14, 5, 0)
 
@@ -36,13 +36,35 @@ def data_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def transcripts_dir(tmp_path: Path) -> Path:
+    return tmp_path / "Documents" / "Transcriber"
+
+
+@pytest.fixture
 def gateway() -> FakeTranscriptionGateway:
     return FakeTranscriptionGateway()
 
 
 @pytest.fixture
-def core(gateway: FakeTranscriptionGateway, data_dir: Path, clock: FakeClock) -> TranscriberCore:
-    return TranscriberCore(gateway=gateway, data_dir=data_dir, clock=clock)
+def audio() -> FakeAudioCapture:
+    return FakeAudioCapture()
+
+
+@pytest.fixture
+def core(
+    gateway: FakeTranscriptionGateway,
+    audio: FakeAudioCapture,
+    data_dir: Path,
+    transcripts_dir: Path,
+    clock: FakeClock,
+) -> TranscriberCore:
+    return TranscriberCore(
+        gateway=gateway,
+        audio_capture=audio,
+        data_dir=data_dir,
+        transcripts_dir=transcripts_dir,
+        clock=clock,
+    )
 
 
 @pytest.fixture

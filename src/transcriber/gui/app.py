@@ -10,6 +10,7 @@ from platformdirs import user_data_dir
 from PySide6.QtWidgets import QApplication
 
 from ..core.app import TranscriberCore
+from ..core.capture import AudioCapture
 from ..core.gateway import RejectedKeyError, TranscriptionResult
 from ..deepgram_gateway import DeepgramGateway
 from .main_window import MainWindow
@@ -24,10 +25,22 @@ class MissingKeyGateway:
         raise RejectedKeyError("No Deepgram API key. Set DEEPGRAM_API_KEY and restart.")
 
 
+def build_audio_capture() -> AudioCapture | None:
+    if sys.platform != "win32":
+        return None  # ADR-0001: only the Windows implementation exists so far
+    from ..audio.wasapi import WasapiCapture
+
+    return WasapiCapture()
+
+
 def build_core() -> TranscriberCore:
     key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
     gateway = DeepgramGateway(key) if key else MissingKeyGateway()
-    return TranscriberCore(gateway=gateway, data_dir=Path(user_data_dir(APP_NAME, appauthor=False)))
+    return TranscriberCore(
+        gateway=gateway,
+        audio_capture=build_audio_capture(),
+        data_dir=Path(user_data_dir(APP_NAME, appauthor=False)),
+    )
 
 
 def run(argv: list[str] | None = None) -> int:

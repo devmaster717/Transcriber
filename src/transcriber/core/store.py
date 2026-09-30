@@ -24,6 +24,17 @@ class TranscriptStore:
     def load(self, transcript_id: str) -> Transcript:
         return _from_json(json.loads(self._path(transcript_id).read_text(encoding="utf-8")))
 
+    def load_all(self) -> list[Transcript]:
+        if not self._dir.exists():
+            return []
+        return [
+            _from_json(json.loads(p.read_text(encoding="utf-8")))
+            for p in sorted(self._dir.glob("*.json"))
+        ]
+
+    def delete(self, transcript_id: str) -> None:
+        self._path(transcript_id).unlink(missing_ok=True)
+
     def _path(self, transcript_id: str) -> Path:
         return self._dir / f"{transcript_id}.json"
 

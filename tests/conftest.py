@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -10,6 +10,24 @@ from transcriber.core.app import TranscriberCore
 from .fakes import FakeTranscriptionGateway
 
 FIXED_NOW = datetime(2026, 9, 30, 14, 5, 0)
+
+
+class FakeClock:
+    """A clock the test moves by hand."""
+
+    def __init__(self, now: datetime = FIXED_NOW) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs) -> None:
+        self.now += timedelta(**kwargs)
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    return FakeClock()
 
 
 @pytest.fixture
@@ -23,8 +41,8 @@ def gateway() -> FakeTranscriptionGateway:
 
 
 @pytest.fixture
-def core(gateway: FakeTranscriptionGateway, data_dir: Path) -> TranscriberCore:
-    return TranscriberCore(gateway=gateway, data_dir=data_dir, clock=lambda: FIXED_NOW)
+def core(gateway: FakeTranscriptionGateway, data_dir: Path, clock: FakeClock) -> TranscriberCore:
+    return TranscriberCore(gateway=gateway, data_dir=data_dir, clock=clock)
 
 
 @pytest.fixture
@@ -34,3 +52,17 @@ def audio_file(tmp_path: Path) -> Path:
     path.parent.mkdir()
     path.write_bytes(b"not really audio")
     return path
+
+
+@pytest.fixture
+def make_audio_file(tmp_path: Path):
+    """Create further File Sources by name, in the same recordings folder."""
+    folder = tmp_path / "recordings"
+    folder.mkdir(exist_ok=True)
+
+    def _make(name: str) -> Path:
+        path = folder / name
+        path.write_bytes(b"not really audio")
+        return path
+
+    return _make

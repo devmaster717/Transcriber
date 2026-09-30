@@ -6,14 +6,17 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -25,10 +28,11 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.app import LibraryEntry, TranscriberCore
+from ..core.capture import CaptureError, CaptureState
 from ..core.gateway import TranscriptionError
-from ..core.model import Transcript
+from ..core.model import SourceKind, Transcript
 from ..core.queue import QueueItem, QueueState
-from ..core.rendering import format_duration, render
+from ..core.rendering import format_duration, format_timestamp, render
 
 AUDIO_FILTER = (
     "Audio and video (*.mp3 *.wav *.m4a *.mp4 *.flac *.ogg *.webm *.aac *.wma *.opus *.mkv *.mov);;"
@@ -96,6 +100,24 @@ class MainWindow(QMainWindow):
         top.addWidget(self.open_button)
         top.addWidget(self.status, stretch=1)
 
+        # Capture controls
+        self.source_kind = QComboBox()
+        self.source_kind.addItem(SourceKind.MICROPHONE.label, SourceKind.MICROPHONE)
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("Title (optional)")
+        self.capture_button = QPushButton("Start capture")
+        self.capture_button.clicked.connect(self._toggle_capture)
+        self.capture_indicator = QLabel("")
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._tick)
+        capture_row = QHBoxLayout()
+        capture_row.addWidget(QLabel("Capture"))
+        capture_row.addWidget(self.source_kind)
+        capture_row.addWidget(self.title_edit, stretch=1)
+        capture_row.addWidget(self.capture_button)
+        capture_row.addWidget(self.capture_indicator)
+
         # Queue
         self.queue_list = QListWidget()
         self.queue_list.setMaximumHeight(140)
@@ -145,6 +167,7 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addLayout(top)
+        layout.addLayout(capture_row)
         layout.addWidget(splitter, stretch=1)
         container = QWidget()
         container.setLayout(layout)
@@ -152,6 +175,69 @@ class MainWindow(QMainWindow):
 
         self.refresh_library()
         self.refresh_queue()
+
+    # ---- Capture -------------------------------------------------------------------------
+
+    @Slot()
+    def _toggle_capture(self) -> None:
+        if self._core.capture_status().state is CaptureState.CAPTURING:
+            self._stop_capture()
+        else:
+            self._start_capture()
+
+    def _start_capture(self) -> None:
+        kind = SourceKind(self.source_kind.currentData())  # Qt hands a StrEnum back as a plain str
+        try:
+            status = self._core.start_capture(kind, self.title_edit.text())
+        except CaptureError as e:
+            self.status.setText(e.message)
+            return
+        self.capture_button.setText("Stop")
+        self.source_kind.setEnabled(False)
+        self.title_edit.setEnabled(False)
+        self.status.setText(f"Capturing {status.title} from the {kind.label}.")
+        self._tick()
+        self._elapsed_timer.start()
+
+    def _stop_capture(self) -> None:
+        self._elapsed_timer.stop()
+        self.capture_button.setEnabled(False)
+        self.capture_indicator.setText("Finalising…")
+        self.status.setText("Sending the Recording to Deepgram…")
+        worker = CoreWorker(self._core.stop_capture, parent=self)
+        worker.ready.connect(self._on_capture_ready)
+        worker.failed.connect(self._on_capture_failed)
+        self._capture_worker = worker
+        worker.start()
+
+    @Slot()
+    def _tick(self) -> None:
+        started = self._core.capture_status().started_at
+        if started is None:
+            return
+        elapsed = (datetime.now() - started).total_seconds()
+        self.capture_indicator.setText(f"● Capturing {format_timestamp(max(0.0, elapsed))}")
+        self.capture_indicator.setStyleSheet("color: firebrick; font-weight: bold;")
+
+    @Slot(object)
+    def _on_capture_ready(self, transcript: Transcript) -> None:
+        self._reset_capture_controls()
+        self.title_edit.clear()
+        self.refresh_library(select_id=transcript.id)
+        self.status.setText(f"Saved to {transcript.rendering_path}")
+
+    @Slot(str)
+    def _on_capture_failed(self, message: str) -> None:
+        self._reset_capture_controls()
+        self.status.setText(f"{message} The Recording was kept.")
+
+    def _reset_capture_controls(self) -> None:
+        self.capture_button.setText("Start capture")
+        self.capture_button.setEnabled(True)
+        self.source_kind.setEnabled(True)
+        self.title_edit.setEnabled(True)
+        self.capture_indicator.setText("")
+        self.capture_indicator.setStyleSheet("")
 
     # ---- Drag and drop -------------------------------------------------------------------
 

@@ -35,9 +35,19 @@ One contract test talks to the real Deepgram API and only runs when `DEEPGRAM_AP
 DEEPGRAM_API_KEY=... uv run pytest tests/test_deepgram_gateway.py
 ```
 
+## Capturing
+
+Pick a Source, optionally type a title, and press **Start capture**. Press **Stop** and the
+Recording is sent to Deepgram, the Transcript is written to `Documents/Transcriber/`, and the
+Recording is deleted (see ADR-0002). If the Deepgram call fails the Recording is kept.
+
+Capture uses the default Windows microphone through WASAPI (see ADR-0001). Device selection is
+a later ticket.
+
 ## Layout
 
 - `src/transcriber/core/`: the headless core. No Qt imports. The public API is `TranscriberCore`.
 - `src/transcriber/deepgram_gateway.py`: the real transcription gateway over the Deepgram SDK.
+- `src/transcriber/audio/`: platform implementations of the audio capture interface (Windows WASAPI).
 - `src/transcriber/gui/`: the thin PySide6 shell.
 - `tests/`: core tests, the fakes, and fixtures.

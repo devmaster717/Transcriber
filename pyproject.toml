@@ -1,0 +1,25 @@
+[project]
+name = "transcriber"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "devmaster717", email = "briancui6717@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "deepgram-sdk>=7.11.0",
+    "platformdirs>=4.12.2",
+    "pyside6>=6.11.2",
+]
+
+[project.scripts]
+transcriber = "transcriber:main"
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

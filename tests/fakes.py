@@ -20,15 +20,22 @@ def canned_result() -> TranscriptionResult:
 
 
 class FakeTranscriptionGateway:
-    """Returns a canned result, or fails on command. Records what it was asked to transcribe."""
+    """Returns a canned result, or fails on command. Records what it was asked to transcribe.
+
+    `fail_with` fails every request; `fail_for[path]` fails just that path. Both are read at
+    request time, so a test can clear them to model a retry that succeeds.
+    """
 
     def __init__(self, result: TranscriptionResult | None = None) -> None:
         self.result = result or canned_result()
         self.fail_with: Exception | None = None
+        self.fail_for: dict[Path, Exception] = {}
         self.requests: list[Path] = []
 
     def transcribe(self, audio: Path) -> TranscriptionResult:
         self.requests.append(audio)
+        if audio in self.fail_for:
+            raise self.fail_for[audio]
         if self.fail_with is not None:
             raise self.fail_with
         return self.result

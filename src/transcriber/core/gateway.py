@@ -12,6 +12,8 @@ from typing import Protocol
 
 from .model import Paragraph
 
+MAX_FILE_BYTES = 2 * 1024**3  # Deepgram's pre-recorded limit; the core refuses larger Files before any request
+
 
 class TranscriptionError(Exception):
     """The gateway could not produce a result. `message` is safe to show to the user."""

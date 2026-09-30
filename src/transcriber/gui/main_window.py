@@ -1,4 +1,4 @@
-"""Main window: the Library on the left, the Rendering of the selected Transcript on the right."""
+"""Main window: the queue and Library on the left, the Rendering of the selected Transcript on the right."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from ..core.app import LibraryEntry, TranscriberCore
 from ..core.gateway import TranscriptionError
 from ..core.model import Transcript
+from ..core.queue import QueueItem, QueueState
 from ..core.rendering import format_duration, render
 
 AUDIO_FILTER = (
@@ -34,6 +35,12 @@ AUDIO_FILTER = (
     "All files (*)"
 )
 ID_ROLE = Qt.ItemDataRole.UserRole
+STATE_LABEL = {
+    QueueState.WAITING: "waiting",
+    QueueState.TRANSCRIBING: "transcribing…",
+    QueueState.DONE: "done",
+    QueueState.FAILED: "failed",
+}
 
 
 class CoreWorker(QThread):
@@ -55,23 +62,51 @@ class CoreWorker(QThread):
             self.failed.emit(f"Could not read the file: {e.strerror or e}")
 
 
+class QueueWorker(QThread):
+    """Drains the File queue one item at a time until nothing is waiting."""
+
+    changed = Signal(object)  # QueueItem
+
+    def __init__(self, core: TranscriberCore, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._core = core
+
+    def run(self) -> None:
+        while (item := self._core.process_next()) is not None:
+            self.changed.emit(item)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, core: TranscriberCore) -> None:
         super().__init__()
         self._core = core
         self._worker: CoreWorker | None = None
+        self._queue_worker: QueueWorker | None = None
         self._entries: dict[str, LibraryEntry] = {}
         self.setWindowTitle("Transcriber")
-        self.resize(1000, 640)
+        self.resize(1000, 680)
+        self.setAcceptDrops(True)
 
         # Top bar
-        self.open_button = QPushButton("Open file…")
-        self.open_button.clicked.connect(self._choose_file)
-        self.status = QLabel("Open an audio file to transcribe it.")
+        self.open_button = QPushButton("Open files…")
+        self.open_button.clicked.connect(self._choose_files)
+        self.status = QLabel("Open audio files, or drop them onto this window.")
         self.status.setWordWrap(True)
         top = QHBoxLayout()
         top.addWidget(self.open_button)
         top.addWidget(self.status, stretch=1)
+
+        # Queue
+        self.queue_list = QListWidget()
+        self.queue_list.setMaximumHeight(140)
+        self.queue_list.currentItemChanged.connect(self._on_queue_selection_changed)
+        self.retry_button = QPushButton("Retry")
+        self.retry_button.setEnabled(False)
+        self.retry_button.clicked.connect(self._retry)
+        queue_header = QHBoxLayout()
+        queue_header.addWidget(QLabel("Queue"))
+        queue_header.addStretch(1)
+        queue_header.addWidget(self.retry_button)
 
         # Library
         self.library_list = QListWidget()
@@ -87,12 +122,15 @@ class MainWindow(QMainWindow):
         actions = QHBoxLayout()
         for b in (self.open_folder_button, self.open_file_button, self.retranscribe_button, self.remove_button):
             actions.addWidget(b)
-        library_panel = QWidget()
-        library_layout = QVBoxLayout(library_panel)
-        library_layout.setContentsMargins(0, 0, 0, 0)
-        library_layout.addWidget(QLabel("Library"))
-        library_layout.addWidget(self.library_list, stretch=1)
-        library_layout.addLayout(actions)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addLayout(queue_header)
+        left_layout.addWidget(self.queue_list)
+        left_layout.addWidget(QLabel("Library"))
+        left_layout.addWidget(self.library_list, stretch=1)
+        left_layout.addLayout(actions)
 
         # Viewer
         self.viewer = QPlainTextEdit()
@@ -100,7 +138,7 @@ class MainWindow(QMainWindow):
         self.viewer.setPlaceholderText("Select a Transcript to read its Rendering.")
 
         splitter = QSplitter()
-        splitter.addWidget(library_panel)
+        splitter.addWidget(left)
         splitter.addWidget(self.viewer)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
@@ -113,6 +151,98 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
         self.refresh_library()
+        self.refresh_queue()
+
+    # ---- Drag and drop -------------------------------------------------------------------
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 (Qt override)
+        if any(u.isLocalFile() for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 (Qt override)
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
+        files = [p for p in paths if p.is_file()]
+        if files:
+            self.enqueue(files)
+            event.acceptProposedAction()
+
+    # ---- Queue ---------------------------------------------------------------------------
+
+    @Slot()
+    def _choose_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open audio files", "", AUDIO_FILTER)
+        if paths:
+            self.enqueue([Path(p) for p in paths])
+
+    def enqueue(self, paths: list[Path]) -> None:
+        """Queue Files for transcription and make sure the worker is draining the queue."""
+        self._core.enqueue(paths)
+        self.refresh_queue()
+        self._ensure_queue_running()
+
+    def _ensure_queue_running(self) -> None:
+        if self._queue_worker is not None and self._queue_worker.isRunning():
+            return
+        self._queue_worker = QueueWorker(self._core, parent=self)
+        self._queue_worker.changed.connect(self._on_queue_item_changed)
+        self._queue_worker.finished.connect(self._on_queue_drained)
+        self._queue_worker.start()
+
+    @Slot(object)
+    def _on_queue_item_changed(self, item: QueueItem) -> None:
+        self.refresh_queue()
+        if item.state is QueueState.DONE and item.transcript_id is not None:
+            self.refresh_library(select_id=item.transcript_id)
+            self.status.setText(f"Transcribed {item.path.name}")
+        elif item.state is QueueState.FAILED:
+            self.status.setText(f"{item.path.name}: {item.error}")
+
+    @Slot()
+    def _on_queue_drained(self) -> None:
+        # An item added while the worker was finishing would otherwise wait forever.
+        if any(i.state is QueueState.WAITING for i in self._core.queue()):
+            self._ensure_queue_running()
+
+    def refresh_queue(self) -> None:
+        selected = self._selected_queue_id()
+        self.queue_list.blockSignals(True)
+        self.queue_list.clear()
+        for item in self._core.queue():
+            text = f"{item.path.name} — {STATE_LABEL[item.state]}"
+            if item.state is QueueState.FAILED and item.error:
+                text += f": {item.error}"
+            row = QListWidgetItem(text)
+            row.setData(ID_ROLE, item.id)
+            if item.state is QueueState.FAILED:
+                row.setForeground(QColor("firebrick"))
+            elif item.state is QueueState.DONE:
+                row.setForeground(QColor("gray"))
+            self.queue_list.addItem(row)
+            if item.id == selected:
+                self.queue_list.setCurrentItem(row)
+        self.queue_list.blockSignals(False)
+        self._update_retry_button()
+
+    def _selected_queue_id(self) -> str | None:
+        row = self.queue_list.currentItem()
+        return row.data(ID_ROLE) if row is not None else None
+
+    @Slot(QListWidgetItem, QListWidgetItem)
+    def _on_queue_selection_changed(self, _current, _previous) -> None:
+        self._update_retry_button()
+
+    def _update_retry_button(self) -> None:
+        selected = self._selected_queue_id()
+        failed = any(i.id == selected and i.state is QueueState.FAILED for i in self._core.queue())
+        self.retry_button.setEnabled(failed)
+
+    @Slot()
+    def _retry(self) -> None:
+        selected = self._selected_queue_id()
+        if selected is not None:
+            self._core.retry(selected)
+            self.refresh_queue()
+            self._ensure_queue_running()
 
     # ---- Library -------------------------------------------------------------------------
 
@@ -131,23 +261,23 @@ class MainWindow(QMainWindow):
             )
             if entry.missing_files:
                 summary += " · not found"
-            item = QListWidgetItem(f"{t.title}\n{summary}")
-            item.setData(ID_ROLE, t.id)
+            row = QListWidgetItem(f"{t.title}\n{summary}")
+            row.setData(ID_ROLE, t.id)
             if entry.missing_files:
-                item.setForeground(QColor("gray"))
-            self.library_list.addItem(item)
+                row.setForeground(QColor("gray"))
+            self.library_list.addItem(row)
         self.library_list.blockSignals(False)
-        for row in range(self.library_list.count()):
-            if self.library_list.item(row).data(ID_ROLE) == select_id:
-                self.library_list.setCurrentRow(row)
+        for i in range(self.library_list.count()):
+            if self.library_list.item(i).data(ID_ROLE) == select_id:
+                self.library_list.setCurrentRow(i)
                 break
         else:
             self.library_list.setCurrentRow(-1)
             self._show_entry(None)
 
     def selected_id(self) -> str | None:
-        item = self.library_list.currentItem()
-        return item.data(ID_ROLE) if item is not None else None
+        row = self.library_list.currentItem()
+        return row.data(ID_ROLE) if row is not None else None
 
     def selected_entry(self) -> LibraryEntry | None:
         selected = self.selected_id()
@@ -177,17 +307,7 @@ class MainWindow(QMainWindow):
         else:
             self.status.setText(f"{entry.transcript.rendering_path}")
 
-    # ---- Actions -------------------------------------------------------------------------
-
-    @Slot()
-    def _choose_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open audio file", "", AUDIO_FILTER)
-        if path:
-            self.transcribe(Path(path))
-
-    def transcribe(self, path: Path) -> None:
-        """Start transcribing a File. Public so the app can be driven without the dialog."""
-        self._run(f"Transcribing {path.name}…", lambda: self._core.transcribe_file(path))
+    # ---- Library actions -----------------------------------------------------------------
 
     @Slot()
     def _retranscribe(self) -> None:
@@ -219,35 +339,31 @@ class MainWindow(QMainWindow):
     @Slot()
     def _open_rendering(self) -> None:
         entry = self.selected_entry()
-        if entry is not None and entry.rendering_found and entry.transcript.rendering_path is not None:
-            os.startfile(entry.transcript.rendering_path) if sys.platform == "win32" else QDesktopServices.openUrl(
-                QUrl.fromLocalFile(str(entry.transcript.rendering_path))
-            )
+        if entry is None or not entry.rendering_found or entry.transcript.rendering_path is None:
+            return
+        if sys.platform == "win32":
+            os.startfile(entry.transcript.rendering_path)
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(entry.transcript.rendering_path)))
 
-    # ---- Worker plumbing --------------------------------------------------------------------
+    # ---- Single-operation worker (re-transcribe) ----------------------------------------
 
     def _run(self, status: str, operation: Callable[[], Transcript]) -> None:
         if self._worker is not None and self._worker.isRunning():
             return
-        self._set_busy(True)
+        self.retranscribe_button.setEnabled(False)
         self.status.setText(status)
         self._worker = CoreWorker(operation, parent=self)
         self._worker.ready.connect(self._on_ready)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
 
-    def _set_busy(self, busy: bool) -> None:
-        self.open_button.setEnabled(not busy)
-        self.retranscribe_button.setEnabled(not busy and self.retranscribe_button.isEnabled())
-
     @Slot(object)
     def _on_ready(self, transcript: Transcript) -> None:
-        self._set_busy(False)
         self.refresh_library(select_id=transcript.id)
         self.status.setText(f"Saved to {transcript.rendering_path}")
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:
-        self._set_busy(False)
         self.status.setText(message)
         self._show_entry(self.selected_entry())

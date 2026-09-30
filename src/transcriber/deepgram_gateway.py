@@ -16,8 +16,6 @@ from deepgram.core.api_error import ApiError
 from .core.gateway import RejectedKeyError, TranscriptionError, TranscriptionResult
 from .core.model import Paragraph
 
-MAX_FILE_BYTES = 2 * 1024**3  # Deepgram's pre-recorded limit
-
 PRERECORDED_OPTIONS: dict[str, Any] = {
     "model": "nova-3",
     "language": "en",
@@ -33,8 +31,6 @@ class DeepgramGateway:
         self._client = DeepgramClient(api_key=api_key)
 
     def transcribe(self, audio: Path) -> TranscriptionResult:
-        if audio.stat().st_size > MAX_FILE_BYTES:
-            raise TranscriptionError("File is larger than Deepgram's 2 GB limit.")
         try:
             response = self._client.listen.v1.media.transcribe_file(
                 request=audio.read_bytes(), **PRERECORDED_OPTIONS

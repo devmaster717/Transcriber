@@ -1,0 +1,3 @@
+# Live Captions are display-only; the saved Transcript comes from a second pass
+
+During a Capture the audio is streamed to Deepgram's live endpoint and the results are shown as Live Captions. When the Capture stops, the whole Recording is sent again to Deepgram's pre-recorded endpoint, and that result becomes the Transcript. The audio is therefore paid for twice. We accept this because the pre-recorded endpoint gives better paragraphs and speaker separation than the stream, and because a dropped connection mid-call loses words from the stream but not from the local Recording. A reader who sees two Deepgram calls for one Capture should not "optimise" one away.

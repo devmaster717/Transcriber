@@ -1,0 +1,3 @@
+# Recordings are discarded once their Transcript exists
+
+The audio of a Capture (the Recording) is kept only until a Transcript has been successfully written, then deleted. A personal tool should not accumulate gigabytes of call audio, and the user does not want the app to be an archive of private calls. The trade-off is that a Capture can never be re-transcribed later, so "re-transcribe" applies only to File Sources. To avoid losing more than the audio, the app keeps the full Deepgram result (speakers, timing, paragraphs) for every Transcript, so any rendering (with or without timestamps and speaker labels) can be regenerated without the audio. If the transcription pass fails, the Recording is kept and a Retry is offered; the delete happens only after success.

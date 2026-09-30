@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .gateway import TranscriptionGateway
+from .gateway import MAX_FILE_BYTES, TranscriptionError, TranscriptionGateway
 from .model import SourceKind, Transcript, TranscriptStatus, default_speaker_name
+from .queue import FileQueue, QueueItem, QueueState
 from .rendering import render
 from .store import TranscriptStore
 
@@ -23,7 +24,14 @@ class TranscriptReady:
     transcript: Transcript
 
 
-Event = TranscriptReady
+@dataclass(frozen=True)
+class QueueChanged:
+    """A queued File changed state."""
+
+    item: QueueItem
+
+
+Event = TranscriptReady | QueueChanged
 EventHandler = Callable[[Event], None]
 
 
@@ -54,10 +62,13 @@ class TranscriberCore:
         gateway: TranscriptionGateway,
         data_dir: Path,
         clock: Clock = datetime.now,
+        max_file_bytes: int = MAX_FILE_BYTES,
     ) -> None:
         self._gateway = gateway
         self._store = TranscriptStore(data_dir)
         self._clock = clock
+        self._max_file_bytes = max_file_bytes
+        self._queue = FileQueue()
         self._handlers: list[EventHandler] = []
 
     def subscribe(self, handler: EventHandler) -> None:
@@ -87,7 +98,49 @@ class TranscriberCore:
             raise ValueError("Only a File Transcript can be re-transcribed; a Capture's Recording is gone.")
         return self._transcribe_source(previous.id, previous.source_path)
 
+    # ---- File queue ----------------------------------------------------------------------
+
+    def enqueue(self, paths: list[Path]) -> list[QueueItem]:
+        """Add Files to the queue. They wait until `process_next` reaches them."""
+        items = self._queue.add(paths)
+        for item in items:
+            self._emit(QueueChanged(item))
+        return items
+
+    def queue(self) -> list[QueueItem]:
+        return self._queue.items()
+
+    def process_next(self) -> QueueItem | None:
+        """Transcribe the first waiting File. Returns its final item, or None if nothing waits.
+
+        A failure marks only that item failed, with a message; the rest of the queue is untouched.
+        """
+        item = self._queue.claim_next()
+        if item is None:
+            return None
+        self._emit(QueueChanged(item))
+        try:
+            transcript = self.transcribe_file(item.path)
+        except TranscriptionError as e:
+            item = self._queue.update(item.id, state=QueueState.FAILED, error=e.message)
+        except OSError as e:
+            item = self._queue.update(item.id, state=QueueState.FAILED, error=f"Could not read the file: {e.strerror or e}")
+        else:
+            item = self._queue.update(item.id, state=QueueState.DONE, transcript_id=transcript.id)
+        self._emit(QueueChanged(item))
+        return item
+
+    def retry(self, item_id: str) -> QueueItem:
+        """Put a failed item back in line, in its original position."""
+        item = self._queue.update(item_id, state=QueueState.WAITING, error=None)
+        self._emit(QueueChanged(item))
+        return item
+
+    # ---- Internals -----------------------------------------------------------------------
+
     def _transcribe_source(self, transcript_id: str, path: Path) -> Transcript:
+        if path.stat().st_size > self._max_file_bytes:
+            raise TranscriptionError("File is larger than Deepgram's 2 GB limit.")
         result = self._gateway.transcribe(path)
         speakers = sorted({p.speaker for p in result.paragraphs})
         transcript = Transcript(

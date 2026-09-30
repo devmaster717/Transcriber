@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Build output
+build/
+dist/
+*.spec
+
+# Local secrets and scratch
+.env
+.scratch/

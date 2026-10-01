@@ -71,7 +71,7 @@ class CoreWorker(QThread):
         except KeyProblem as e:
             self.failed.emit(e.message)
             self.key_problem.emit(e.message)
-        except TranscriptionError as e:
+        except (TranscriptionError, CaptureError) as e:
             self.failed.emit(e.message)
         except OSError as e:
             self.failed.emit(f"Could not read the file: {e.strerror or e}")
@@ -286,24 +286,34 @@ class MainWindow(QMainWindow):
             self._start_capture()
 
     def _start_capture(self) -> None:
+        """Opening the Deepgram stream and the audio devices takes a moment, so it runs off the Qt thread."""
         kind = SourceKind(self.source_kind.currentData())  # Qt hands a StrEnum back as a plain str
-        try:
-            status = self._core.start_capture(kind, self.title_edit.text())
-        except KeyProblem as e:
-            self.status.setText(e.message)
-            self.open_settings(e.message)
-            return
-        except CaptureError as e:
-            self.status.setText(e.message)
-            return
-        self.capture_button.setText("Stop")
+        title = self.title_edit.text()
+        self.capture_button.setEnabled(False)
         self.source_kind.setEnabled(False)
         self.title_edit.setEnabled(False)
-        self.status.setText(f"Capturing {status.title} from the {kind.label}.")
+        self.status.setText(f"Starting a {kind.label}…")
+        worker = CoreWorker(lambda: self._core.start_capture(kind, title), parent=self)
+        worker.ready.connect(self._on_capture_started)
+        worker.failed.connect(self._on_capture_start_failed)
+        worker.key_problem.connect(self.open_settings)
+        self._capture_worker = worker
+        worker.start()
+
+    @Slot(object)
+    def _on_capture_started(self, status) -> None:
+        self.capture_button.setText("Stop")
+        self.capture_button.setEnabled(True)
+        self.status.setText(f"Capturing {status.title} from the {status.kind.label}.")
         self.captions_view.clear()
         self.right_stack.setCurrentWidget(self.captions_view)
         self._tick()
         self._elapsed_timer.start()
+
+    @Slot(str)
+    def _on_capture_start_failed(self, message: str) -> None:
+        self._reset_capture_controls()
+        self.status.setText(message)
 
     def _stop_capture(self) -> None:
         self._elapsed_timer.stop()
@@ -363,25 +373,27 @@ class MainWindow(QMainWindow):
 
     def _show_captions(self, live: LiveCaptions) -> None:
         meeting = self._core.capture_status().kind is SourceKind.MEETING
-        lines = [f"<b>{self._caption_speaker(c, meeting)}:</b> {html_escape(c.text)}" for c in live.final]
-        if live.provisional is not None:
-            lines.append(
-                f'<span style="color: gray;"><i>{self._caption_speaker(live.provisional, meeting)}: '
-                f"{html_escape(live.provisional.text)}</i></span>"
-            )
+        rendered = []
+        for line in live.lines():
+            parts = [f"<b>{self._caption_speaker(line, meeting)}:</b>"]
+            if line.text:
+                parts.append(html_escape(line.text))
+            if line.provisional_text:
+                parts.append(f'<span style="color: gray;"><i>{html_escape(line.provisional_text)}</i></span>')
+            rendered.append(" ".join(parts))
         if live.reconnecting:
-            lines.append('<span style="color: firebrick;">Reconnecting to Deepgram… the Recording continues.</span>')
-        self.captions_view.setHtml("<br>".join(lines))
+            rendered.append('<span style="color: firebrick;">Reconnecting to Deepgram… the Recording continues.</span>')
+        self.captions_view.setHtml("<br>".join(rendered))
         self.captions_view.verticalScrollBar().setValue(self.captions_view.verticalScrollBar().maximum())
 
     @staticmethod
-    def _caption_speaker(caption, meeting: bool) -> str:
+    def _caption_speaker(line, meeting: bool) -> str:
         """Live Captions label: in a Meeting the Microphone channel is You and System Audio speakers are numbered."""
-        if meeting and caption.channel == 0:
+        if meeting and line.channel == 0:
             return "You"
-        if caption.speaker is None:
+        if line.speaker is None:
             return "Speaker"
-        return f"Speaker {caption.speaker + 1}"
+        return f"Speaker {line.speaker + 1}"
 
     @Slot(object)
     def _on_capture_ready(self, transcript: Transcript) -> None:

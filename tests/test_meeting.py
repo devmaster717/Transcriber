@@ -96,6 +96,24 @@ def test_a_stalled_device_is_padded_with_silence_so_the_channels_stay_aligned(
     assert gateway.request_bytes[0][44:] == b"\x01\x00\x00\x00" * (1600 * 3)
 
 
+def test_in_a_meeting_the_microphone_channel_is_one_voice_whatever_speaker_ids_the_service_guesses(
+    gateway, data_dir, transcripts_dir, clock
+):
+    core, audio = make_core(gateway, data_dir, transcripts_dir, clock)
+    core.start_capture(SourceKind.MEETING)
+    s = gateway.stream
+    s.deliver(Caption("Let me share my", True, 0.4, speaker=0, channel=0))
+    s.deliver(Caption("screen with you.", True, 2.0, speaker=1, channel=0, ends_utterance=True))
+    s.deliver(Caption("Go ahead.", True, 3.0, speaker=0, channel=1))
+    s.deliver(Caption("Yes please.", True, 3.5, speaker=1, channel=1))
+
+    assert [(c.channel, c.text) for c in core.live_captions().final] == [
+        (0, "Let me share my screen with you."),
+        (1, "Go ahead."),
+        (1, "Yes please."),
+    ]
+
+
 def test_live_captions_in_a_meeting_carry_the_channel(gateway, data_dir, transcripts_dir, clock):
     core, audio = make_core(gateway, data_dir, transcripts_dir, clock)
     core.start_capture(SourceKind.MEETING)

@@ -315,7 +315,9 @@ class TranscriberCore:
             )
             self._capture = active
             with self._live_lock:
-                self._live = LiveCaptions()
+                # In a Meeting Capture channel 0 is the Microphone: one voice, "You".
+                single_voice = frozenset({0}) if kind is SourceKind.MEETING else frozenset()
+                self._live = LiveCaptions(single_voice_channels=single_voice)
             status = CaptureStatus(CaptureState.CAPTURING, clean_title, started, recorder.path, kind=kind)
             self._capture_status = status
         self._emit(CaptureChanged(status))
@@ -398,7 +400,7 @@ class TranscriberCore:
 
     def _set_reconnecting(self, reconnecting: bool) -> None:
         with self._live_lock:
-            self._live = LiveCaptions(self._live.final, self._live.provisional, reconnecting)
+            self._live = replace(self._live, reconnecting=reconnecting)
             live = self._live
         self._emit(CaptionsChanged(live))
 

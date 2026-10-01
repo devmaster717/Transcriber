@@ -37,7 +37,7 @@ from ..core.app import ApiKeyProblem, CaptionsChanged, LibraryEntry, Transcriber
 from ..core.capture import CaptureError, CaptureState, LiveCaptions
 from ..core.gateway import KeyProblem, TranscriptionError
 from ..core.model import SourceKind, Transcript, TranscriptStatus
-from ..core.queue import QueueItem, QueueState
+from ..core.queue import FINISHED_STATES, QueueItem, QueueState
 from ..core.rendering import RenderingOptions, format_duration, format_timestamp, render
 from .settings_dialog import SettingsDialog
 
@@ -51,6 +51,7 @@ STATE_LABEL = {
     QueueState.TRANSCRIBING: "transcribing…",
     QueueState.DONE: "done",
     QueueState.FAILED: "failed",
+    QueueState.CANCELLED: "cancelled",
 }
 
 
@@ -153,10 +154,18 @@ class MainWindow(QMainWindow):
         self.retry_button = QPushButton("Retry")
         self.retry_button.setEnabled(False)
         self.retry_button.clicked.connect(self._retry)
+        self.cancel_button = QPushButton("Remove")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self._cancel_queue_item)
+        self.clear_button = QPushButton("Clear finished")
+        self.clear_button.setEnabled(False)
+        self.clear_button.clicked.connect(self._clear_finished)
         queue_header = QHBoxLayout()
         queue_header.addWidget(QLabel("Queue"))
         queue_header.addStretch(1)
         queue_header.addWidget(self.retry_button)
+        queue_header.addWidget(self.cancel_button)
+        queue_header.addWidget(self.clear_button)
 
         # Library
         self.library_list = QListWidget()
@@ -459,6 +468,8 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Transcribed {item.path.name}")
         elif item.state is QueueState.FAILED:
             self.status.setText(f"{item.path.name}: {item.error}")
+        elif item.state is QueueState.CANCELLED:
+            self.status.setText(f"Cancelled {item.path.name}.")
 
     @Slot()
     def _on_queue_drained(self) -> None:
@@ -478,13 +489,13 @@ class MainWindow(QMainWindow):
             row.setData(ID_ROLE, item.id)
             if item.state is QueueState.FAILED:
                 row.setForeground(QColor("firebrick"))
-            elif item.state is QueueState.DONE:
+            elif item.state in (QueueState.DONE, QueueState.CANCELLED):
                 row.setForeground(QColor("gray"))
             self.queue_list.addItem(row)
             if item.id == selected:
                 self.queue_list.setCurrentItem(row)
         self.queue_list.blockSignals(False)
-        self._update_retry_button()
+        self._update_queue_buttons()
 
     def _selected_queue_id(self) -> str | None:
         row = self.queue_list.currentItem()
@@ -492,12 +503,33 @@ class MainWindow(QMainWindow):
 
     @Slot(QListWidgetItem, QListWidgetItem)
     def _on_queue_selection_changed(self, _current, _previous) -> None:
-        self._update_retry_button()
+        self._update_queue_buttons()
 
-    def _update_retry_button(self) -> None:
+    def _update_queue_buttons(self) -> None:
+        items = self._core.queue()
+        selected = next((i for i in items if i.id == self._selected_queue_id()), None)
+        self.retry_button.setEnabled(selected is not None and selected.state is QueueState.FAILED)
+        self.cancel_button.setEnabled(selected is not None)
+        self.cancel_button.setText(
+            "Cancel" if selected is not None and selected.state is QueueState.TRANSCRIBING else "Remove"
+        )
+        self.clear_button.setEnabled(any(i.state in FINISHED_STATES for i in items))
+
+    @Slot()
+    def _cancel_queue_item(self) -> None:
         selected = self._selected_queue_id()
-        failed = any(i.id == selected and i.state is QueueState.FAILED for i in self._core.queue())
-        self.retry_button.setEnabled(failed)
+        if selected is None:
+            return
+        was_running = any(i.id == selected and i.state is QueueState.TRANSCRIBING for i in self._core.queue())
+        self._core.cancel(selected)
+        self.refresh_queue()
+        if was_running:
+            self.status.setText("Cancelling… the upload is being abandoned.")
+
+    @Slot()
+    def _clear_finished(self) -> None:
+        self._core.clear_finished()
+        self.refresh_queue()
 
     @Slot()
     def _retry(self) -> None:

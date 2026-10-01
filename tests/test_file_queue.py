@@ -79,6 +79,45 @@ def test_a_file_over_the_size_limit_is_rejected_without_a_request(gateway, data_
     assert gateway.requests == []
 
 
+def test_a_waiting_file_can_be_removed_from_the_queue(core, gateway, make_audio_file):
+    first, second = make_audio_file("a.mp3"), make_audio_file("b.mp3")
+    items = core.enqueue([first, second])
+
+    core.cancel(items[1].id)
+
+    assert [i.path for i in core.queue()] == [first]
+    core.process_next()
+    assert gateway.requests == [first]
+
+
+def test_cancelling_the_file_being_transcribed_discards_its_result_and_the_queue_moves_on(core, gateway, make_audio_file):
+    first, second = make_audio_file("long.mkv"), make_audio_file("next.mp3")
+    items = core.enqueue([first, second])
+    gateway.during_request = lambda: core.cancel(items[0].id)  # the user presses Cancel mid-upload
+
+    cancelled = core.process_next()
+
+    assert cancelled.state is QueueState.CANCELLED
+    assert gateway.cancel_calls == 1
+    assert core.library() == []  # the result that came back anyway is thrown away
+    assert not first.with_suffix(".txt").exists()
+    gateway.during_request = None
+    assert core.process_next().state is QueueState.DONE
+    assert [e.transcript.title for e in core.library()] == ["next"]
+
+
+def test_finished_and_failed_items_can_be_cleared_in_one_go(core, gateway, make_audio_file):
+    good, bad, waiting = make_audio_file("good.mp3"), make_audio_file("bad.mp3"), make_audio_file("later.mp3")
+    gateway.fail_for[bad] = TranscriptionError("Deepgram returned an error (503).")
+    core.enqueue([good, bad, waiting])
+    core.process_next()
+    core.process_next()
+
+    core.clear_finished()
+
+    assert [(i.path.name, i.state) for i in core.queue()] == [("later.mp3", QueueState.WAITING)]
+
+
 def test_queue_changes_are_announced_to_subscribers(core, make_audio_file):
     path = make_audio_file("a.mp3")
     received = []

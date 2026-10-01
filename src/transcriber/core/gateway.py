@@ -36,6 +36,10 @@ class MissingKeyError(KeyProblem):
     """No API key is configured anywhere."""
 
 
+class CancelledError(TranscriptionError):
+    """The request was abandoned on purpose; whatever came back is to be discarded."""
+
+
 @dataclass(frozen=True)
 class TranscriptionResult:
     """What the gateway returns for one piece of audio, already in domain terms."""
@@ -86,4 +90,11 @@ class TranscriptionGateway(Protocol):
 
     def open_stream(self, on_caption: OnCaption, on_error: OnStreamError, channels: int = 1) -> LiveStream:
         """Open a live connection. Captions and a terminal error arrive on the gateway's own thread."""
+        ...
+
+    def cancel(self) -> None:
+        """Abort the pre-recorded request in flight, if any, so `transcribe` returns promptly.
+
+        Called from another thread. Implementations may make `transcribe` raise `CancelledError`.
+        """
         ...

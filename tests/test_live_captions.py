@@ -10,6 +10,15 @@ from transcriber.core.model import SourceKind
 from .fakes import FIXTURES, FakeAudioCapture, wav_frames
 
 
+def make_manual_core(gateway, data_dir, transcripts_dir, clock, sleeps):
+    audio = FakeAudioCapture(auto_play=False)
+    core = TranscriberCore(
+        gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir,
+        clock=clock, sleeper=sleeps.append, env={"DEEPGRAM_API_KEY": "test-key"},
+    )
+    return core, audio
+
+
 def test_captured_audio_is_streamed_and_captions_arrive_provisional_then_final(core, gateway, audio):
     core.start_capture(SourceKind.MICROPHONE)
     stream = gateway.stream
@@ -21,7 +30,7 @@ def test_captured_audio_is_streamed_and_captions_arrive_provisional_then_final(c
     assert live.final == ()
     assert live.provisional == Caption(text="Morning every", is_final=False, start=0.4, speaker=0)
 
-    stream.deliver(Caption(text="Morning everyone, can you hear me?", is_final=True, start=0.4, speaker=0))
+    stream.deliver(Caption(text="Morning everyone, can you hear me?", is_final=True, start=0.4, speaker=0, ends_utterance=True))
     stream.deliver(Caption(text="Yes, loud", is_final=False, start=3.5, speaker=1))
     live = core.live_captions()
     assert [c.text for c in live.final] == ["Morning everyone, can you hear me?"]
@@ -107,26 +116,11 @@ def test_provisional_text_continues_the_line_being_built(core, gateway):
     assert live.current_line_text() == "Morning everyone, can you hear me"
 
 
-def test_stopping_closes_the_stream_and_the_transcript_comes_from_the_recording_not_the_captions(core, gateway):
-    core.start_capture(SourceKind.MICROPHONE)
-    gateway.stream.deliver(Caption(text="Something the stream heard", is_final=True, start=0.0, speaker=0))
-
-    transcript = core.stop_capture()
-
-    assert gateway.stream.closed is True
-    assert [p.text for p in transcript.paragraphs] == [
-        "Morning everyone, can you hear me?",
-        "Yes, loud and clear.",
-    ]
-
-
-def test_a_dropped_stream_is_reopened_with_backoff_while_the_recording_continues(gateway, data_dir, transcripts_dir, clock):
-    audio = FakeAudioCapture(auto_play=False)
+def test_a_dropped_stream_is_reopened_with_backoff_and_audio_keeps_flowing_to_the_new_one(
+    gateway, data_dir, transcripts_dir, clock
+):
     sleeps: list[float] = []
-    core = TranscriberCore(
-        gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir,
-        clock=clock, sleeper=sleeps.append, env={"DEEPGRAM_API_KEY": "test-key"},
-    )
+    core, audio = make_manual_core(gateway, data_dir, transcripts_dir, clock, sleeps)
     seen: list[LiveCaptions] = []
     core.subscribe(lambda e: seen.append(e.live) if isinstance(e, CaptionsChanged) else None)
     core.start_capture(SourceKind.MICROPHONE)
@@ -144,30 +138,38 @@ def test_a_dropped_stream_is_reopened_with_backoff_while_the_recording_continues
     assert first.sent == [b"\x01\x00" * 1600]
     assert second.sent == [b"\x02\x00" * 1600]
 
+
+def test_timestamps_stay_continuous_across_a_reconnect(gateway, data_dir, transcripts_dir, clock):
+    """Deepgram restarts its clock with every connection; the Transcript's timeline must not."""
+    sleeps: list[float] = []
+    core, _ = make_manual_core(gateway, data_dir, transcripts_dir, clock, sleeps)
+    core.start_capture(SourceKind.MICROPHONE)
+    gateway.stream.deliver(Caption("Before the drop.", True, 2.0, speaker=0, ends_utterance=True))
+    clock.advance(seconds=30)
+    gateway.stream.drop("connection lost")
+    gateway.stream.deliver(Caption("After the drop.", True, 1.0, speaker=0, ends_utterance=True))
+    clock.advance(seconds=10)
+
     transcript = core.stop_capture()
 
-    assert gateway.request_bytes[0][44:] == b"\x01\x00" * 1600 + b"\x02\x00" * 1600
-    assert transcript.source_kind is SourceKind.MICROPHONE
+    assert [(p.start, p.text) for p in transcript.paragraphs] == [(2.0, "Before the drop."), (31.0, "After the drop.")]
+    assert transcript.duration == 40.0
 
 
-def test_a_stream_that_cannot_open_at_start_is_retried_and_the_capture_still_records(gateway, data_dir, transcripts_dir, clock):
-    audio = FakeAudioCapture(auto_play=False)
+def test_a_stream_that_cannot_open_at_start_is_retried_and_the_capture_still_runs(gateway, data_dir, transcripts_dir, clock):
     sleeps: list[float] = []
-    core = TranscriberCore(
-        gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir,
-        clock=clock, sleeper=sleeps.append, env={"DEEPGRAM_API_KEY": "test-key"},
-    )
+    core, audio = make_manual_core(gateway, data_dir, transcripts_dir, clock, sleeps)
     gateway.fail_open = 1
 
     core.start_capture(SourceKind.MICROPHONE)
-    audio.deliver(b"\x03\x00" * 1600)
     for _ in range(50):
         if gateway.streams:
             break
         time.sleep(0.02)
+    audio.deliver(b"\x03\x00" * 1600)
 
     assert sleeps[:1] == [0.5]
     assert len(gateway.streams) == 1
     assert core.live_captions().reconnecting is False
+    assert gateway.stream.sent == [b"\x03\x00" * 1600]
     core.stop_capture()
-    assert gateway.request_bytes[0][44:] == b"\x03\x00" * 1600

@@ -8,7 +8,6 @@ import re
 import threading
 import time
 import uuid
-import wave
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -23,8 +22,6 @@ from .capture import (
     CaptureStatus,
     DeviceKind,
     LiveCaptions,
-    Recorder,
-    SAMPLE_RATE,
 )
 from .credentials import CredentialStore, NoCredentialStore
 from .gateway import (
@@ -120,11 +117,6 @@ def attribute_speakers(kind: SourceKind, paragraphs: list[Paragraph]) -> tuple[l
     return attributed, names
 
 
-def _wav_channels(path: Path) -> int:
-    with wave.open(str(path), "rb") as w:
-        return w.getnchannels()
-
-
 @dataclass(frozen=True)
 class LibraryEntry:
     """One row of the Library: a Transcript plus whether the files it points at are still there."""
@@ -140,11 +132,8 @@ class LibraryEntry:
 
     @property
     def can_retranscribe(self) -> bool:
-        """A File with its source present, or a provisional Capture whose Recording is still on disk."""
-        t = self.transcript
-        if t.source_path is not None:
-            return self.source_found
-        return t.status is TranscriptStatus.PROVISIONAL and t.recording_path is not None and self.recording_found
+        """Only a File with its source present; a Capture's Transcript came from the live stream (ADR-0004)."""
+        return self.transcript.source_path is not None and self.source_found
 
     @classmethod
     def for_transcript(cls, t: Transcript) -> LibraryEntry:
@@ -163,11 +152,23 @@ class _ActiveCapture:
     title: str
     started_at: datetime
     devices: list[AudioDevice]
-    recorder: Recorder
     channels: int = 1
     handles: list[CaptureHandle] = field(default_factory=list)
     mixer: ChannelMixer | None = None
     stream: LiveStream | None = None
+    stream_offset: float = 0.0  # seconds into the Capture when the current connection opened
+
+
+def _captions_to_result(live: LiveCaptions, duration: float) -> TranscriptionResult:
+    """The Live Captions as a transcription result: one paragraph per line, each ending where the next begins."""
+    lines = list(live.final)
+    paragraphs = []
+    for i, c in enumerate(lines):
+        end = lines[i + 1].start if i + 1 < len(lines) else duration
+        paragraphs.append(
+            Paragraph(start=c.start, end=max(end, c.start), speaker=c.speaker or 0, text=c.text, channel=c.channel)
+        )
+    return TranscriptionResult(duration=duration, paragraphs=paragraphs)
 
 
 def default_transcripts_dir() -> Path:
@@ -193,7 +194,6 @@ class TranscriberCore:
         self._env = env if env is not None else os.environ
         self._store = TranscriptStore(data_dir)
         self._settings = SettingsStore(data_dir)
-        self._recordings_dir = data_dir / "recordings"
         self._transcripts_dir = transcripts_dir or default_transcripts_dir()
         self._clock = clock
         self._max_file_bytes = max_file_bytes
@@ -229,17 +229,14 @@ class TranscriberCore:
         return self._transcribe_source(uuid.uuid4().hex, path)
 
     def retranscribe(self, transcript_id: str) -> Transcript:
-        """Run the gateway again for a Transcript, replacing it in place.
+        """Send a File Transcript's source through the gateway again, replacing the Transcript in place.
 
-        For a File Transcript that means the source File. For a provisional Capture Transcript
-        it means the kept Recording (a Retry of the finalising pass).
+        A Capture cannot be re-transcribed: its Transcript came from the live stream and nothing was kept (ADR-0004).
         """
         previous = self._store.load(transcript_id)
-        if previous.source_path is not None:
-            return self._transcribe_source(previous.id, previous.source_path)
-        if previous.status is TranscriptStatus.PROVISIONAL and previous.recording_path is not None:
-            return self._retry_capture(previous)
-        raise ValueError("A completed Capture cannot be re-transcribed; its Recording is gone (ADR-0002).")
+        if previous.source_path is None:
+            raise ValueError("A Capture cannot be re-transcribed; only a File can (ADR-0004).")
+        return self._transcribe_source(previous.id, previous.source_path)
 
     # ---- File queue ----------------------------------------------------------------------
 
@@ -302,29 +299,25 @@ class TranscriberCore:
         with self._capture_lock:
             if self._capture_status.state in (CaptureState.CAPTURING, CaptureState.FINALISING):
                 raise CaptureError("A Capture is already running.")
-            # A Capture in needs_retry lives on as a provisional Transcript and is retried from the Library,
-            # so it does not block a new one.
             devices = [self._require_device(k) for k in CAPTURE_DEVICE_KINDS[kind]]
             started = self._clock()
             capture_id = uuid.uuid4().hex
             clean_title = (title or "").strip() or started.strftime("%Y-%m-%d %H:%M")
-            recorder = Recorder(self._recordings_dir / f"{capture_id}.wav", channels=len(devices))
             active = _ActiveCapture(
-                id=capture_id, kind=kind, title=clean_title, started_at=started,
-                devices=devices, recorder=recorder, channels=len(devices),
+                id=capture_id, kind=kind, title=clean_title, started_at=started, devices=devices, channels=len(devices)
             )
             self._capture = active
             with self._live_lock:
                 # In a Meeting Capture channel 0 is the Microphone: one voice, "You".
                 single_voice = frozenset({0}) if kind is SourceKind.MEETING else frozenset()
                 self._live = LiveCaptions(single_voice_channels=single_voice)
-            status = CaptureStatus(CaptureState.CAPTURING, clean_title, started, recorder.path, kind=kind)
+            status = CaptureStatus(CaptureState.CAPTURING, clean_title, started, kind=kind)
             self._capture_status = status
         self._emit(CaptureChanged(status))
-        # Live Captions are best effort: a stream that cannot open now is retried in the background,
-        # and the Recording, which the Transcript comes from, does not depend on it (ADR-0003).
+        # The stream is the Transcript (ADR-0004); a stream that cannot open now is retried in the
+        # background and the Capture keeps running, so the user can at least try again without restarting.
         try:
-            active.stream = self._gateway.open_stream(self._on_caption, self._on_stream_error, active.channels)
+            self._open_stream(active)
         except TranscriptionError as e:
             threading.Thread(target=self._on_stream_error, args=(e.message,), daemon=True).start()
         sink = self._make_chunk_sink(active)
@@ -338,6 +331,16 @@ class TranscriberCore:
                 for channel, device in enumerate(devices)
             ]
         return status
+
+    def _open_stream(self, active: _ActiveCapture) -> None:
+        """Open a live connection and remember how far into the Capture it started.
+
+        Deepgram's timestamps restart with every connection; the offset keeps the Transcript's
+        timeline continuous across reconnects.
+        """
+        stream = self._gateway.open_stream(self._on_caption, self._on_stream_error, active.channels)
+        active.stream_offset = (self._clock() - active.started_at).total_seconds()
+        active.stream = stream
 
     def _require_device(self, device_kind: DeviceKind) -> AudioDevice:
         """The device chosen in settings if it is still present, else the Windows default."""
@@ -362,7 +365,6 @@ class TranscriberCore:
 
     def _make_chunk_sink(self, active: _ActiveCapture) -> Callable[[bytes], None]:
         def on_chunk(chunk: bytes) -> None:
-            active.recorder.write(chunk)
             stream = active.stream
             if stream is not None:
                 try:
@@ -373,13 +375,16 @@ class TranscriberCore:
         return on_chunk
 
     def _on_caption(self, caption: Caption) -> None:
+        active = self._capture
+        if active is not None and active.stream_offset:
+            caption = replace(caption, start=caption.start + active.stream_offset)
         with self._live_lock:
             self._live = self._live.with_caption(caption)
             live = self._live
         self._emit(CaptionsChanged(live))
 
     def _on_stream_error(self, reason: str) -> None:
-        """The live connection dropped. Keep recording and reopen it with backoff until the Capture stops."""
+        """The live connection dropped. Reopen it with backoff until the Capture stops; audio sent meanwhile is lost."""
         active = self._capture
         if active is None or self._capture_status.state is not CaptureState.CAPTURING:
             return
@@ -392,7 +397,7 @@ class TranscriberCore:
             if self._capture is not active or self._capture_status.state is not CaptureState.CAPTURING:
                 return
             try:
-                active.stream = self._gateway.open_stream(self._on_caption, self._on_stream_error, active.channels)
+                self._open_stream(active)
             except TranscriptionError:
                 continue
             self._set_reconnecting(False)
@@ -405,9 +410,9 @@ class TranscriberCore:
         self._emit(CaptionsChanged(live))
 
     def stop_capture(self) -> Transcript:
-        """Stop the running Capture and produce its Transcript from the Recording.
+        """Stop the running Capture and turn its Live Captions into the Transcript (ADR-0004).
 
-        The Recording is deleted only once the Transcript and its Rendering are written (ADR-0002).
+        Nothing is sent to Deepgram again. Closing the stream waits briefly for the last results.
         """
         with self._capture_lock:
             active = self._capture
@@ -417,108 +422,37 @@ class TranscriberCore:
                 handle.stop()
             if active.mixer is not None:
                 active.mixer.flush()
-            active.recorder.close()
-            status = CaptureStatus(
-                CaptureState.FINALISING, active.title, active.started_at, active.recorder.path, kind=active.kind
-            )
+            status = CaptureStatus(CaptureState.FINALISING, active.title, active.started_at, kind=active.kind)
             self._capture_status = status
+        self._emit(CaptureChanged(status))
         stream, active.stream = active.stream, None
         if stream is not None:
             try:
-                stream.close()
+                stream.close()  # lets the service flush its final results into the Live Captions
             except Exception:  # noqa: BLE001 - a connection that is already gone is fine here
                 pass
-        self._emit(CaptureChanged(status))
-        try:
-            result = self._gateway.transcribe(active.recorder.path, multichannel=active.channels > 1)
-        except TranscriptionError as e:
-            self._note_key_problem(e)
-            provisional = self._save_provisional(active)
-            with self._capture_lock:
-                self._capture = None
-                self._capture_status = CaptureStatus(
-                    CaptureState.NEEDS_RETRY, active.title, active.started_at, active.recorder.path,
-                    provisional.id, kind=active.kind,
-                )
-            self._emit(CaptureChanged(self._capture_status))
-            return provisional
-        transcript = self._complete_capture(active.id, active.title, active.kind, active.started_at, active.recorder.path, result)
+        duration = (self._clock() - active.started_at).total_seconds()
+        with self._live_lock:
+            live = self._live
+            if live.provisional is not None and live.provisional.text:
+                live = live.with_caption(replace(live.provisional, is_final=True))
+            self._live = live
+        transcript = self._finish(
+            transcript_id=active.id,
+            title=active.title,
+            kind=active.kind,
+            source_path=None,
+            rendering_path=self._capture_rendering_path(active.started_at, active.title),
+            result=_captions_to_result(live, duration),
+            created=active.started_at,
+        )
         with self._capture_lock:
             self._capture = None
-        return transcript
-
-    def _complete_capture(
-        self, transcript_id: str, title: str, kind: SourceKind, started_at: datetime, recording: Path, result: TranscriptionResult
-    ) -> Transcript:
-        """The finalising pass succeeded: write the Transcript and Rendering, then delete the Recording (ADR-0002)."""
-        transcript = self._finish(
-            transcript_id=transcript_id,
-            title=title,
-            kind=kind,
-            source_path=None,
-            rendering_path=self._capture_rendering_path(started_at, title),
-            result=result,
-            created=started_at,
-        )
-        recording.unlink(missing_ok=True)
-        with self._capture_lock:
             self._capture_status = CaptureStatus(
-                CaptureState.COMPLETE, title, started_at, transcript_id=transcript.id, kind=kind
+                CaptureState.COMPLETE, active.title, active.started_at, transcript_id=transcript.id, kind=active.kind
             )
         self._emit(CaptureChanged(self._capture_status))
         return transcript
-
-    def _save_provisional(self, active: _ActiveCapture) -> Transcript:
-        """Keep what the Live Captions heard as a provisional Transcript, so the user has something to read."""
-        live = self.live_captions()
-        heard = [
-            Paragraph(start=c.start, end=c.start, speaker=c.speaker or 0, text=c.text, channel=c.channel)
-            for c in live.final
-        ]
-        paragraphs, speaker_names = attribute_speakers(active.kind, heard)
-        transcript = Transcript(
-            id=active.id,
-            title=active.title,
-            created=active.started_at,
-            duration=active.recorder.frames / SAMPLE_RATE,
-            source_kind=active.kind,
-            source_path=None,
-            paragraphs=paragraphs,
-            speaker_names=speaker_names,
-            status=TranscriptStatus.PROVISIONAL,
-            rendering_path=None,
-            recording_path=active.recorder.path,
-        )
-        self._store.save(transcript)
-        self._emit(TranscriptReady(transcript))
-        return transcript
-
-    def _retry_capture(self, provisional: Transcript) -> Transcript:
-        """Re-run the finalising pass over a kept Recording. On failure the provisional Transcript stands."""
-        recording = provisional.recording_path
-        if recording is None or not recording.exists():
-            raise CaptureError("The Recording for this Capture is no longer on disk.")
-        with self._capture_lock:
-            if self._capture_status.state in (CaptureState.CAPTURING, CaptureState.FINALISING):
-                raise CaptureError("A Capture is already running.")
-            self._capture_status = CaptureStatus(
-                CaptureState.FINALISING, provisional.title, provisional.created, recording, provisional.id
-            )
-        self._emit(CaptureChanged(self._capture_status))
-        try:
-            result = self._gateway.transcribe(recording, multichannel=_wav_channels(recording) > 1)
-        except TranscriptionError as e:
-            self._note_key_problem(e)
-            with self._capture_lock:
-                self._capture_status = CaptureStatus(
-                    CaptureState.NEEDS_RETRY, provisional.title, provisional.created, recording, provisional.id,
-                    kind=provisional.source_kind,
-                )
-            self._emit(CaptureChanged(self._capture_status))
-            return provisional
-        return self._complete_capture(
-            provisional.id, provisional.title, provisional.source_kind, provisional.created, recording, result
-        )
 
     def _capture_rendering_path(self, started: datetime, title: str) -> Path:
         stamp = started.strftime("%Y-%m-%d %H-%M")

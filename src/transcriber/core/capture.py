@@ -59,9 +59,8 @@ class CaptureError(Exception):
 class CaptureState(StrEnum):
     IDLE = "idle"
     CAPTURING = "capturing"
-    FINALISING = "finalising"
+    FINALISING = "finalising"  # the stream is closing and the Live Captions are being written as the Transcript
     COMPLETE = "complete"
-    NEEDS_RETRY = "needs_retry"  # the finalising pass failed; the Recording is kept for a Retry
 
 
 @dataclass(frozen=True)

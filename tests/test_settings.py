@@ -69,21 +69,6 @@ def test_a_rejected_key_fails_the_queued_file_and_announces_a_key_problem(gatewa
     assert [p.message for p in problems] == ["Deepgram rejected the API key."]
 
 
-def test_a_rejected_key_during_the_finalising_pass_keeps_the_recording_and_announces_a_key_problem(
-    gateway, data_dir, transcripts_dir, clock
-):
-    core = make_core(gateway, data_dir, transcripts_dir, clock, env={"DEEPGRAM_API_KEY": "bad"})
-    received = []
-    core.subscribe(received.append)
-    core.start_capture(SourceKind.MICROPHONE)
-    gateway.fail_with = RejectedKeyError("Deepgram rejected the API key.")
-
-    provisional = core.stop_capture()
-
-    assert provisional.recording_path.exists()
-    assert any(isinstance(e, ApiKeyProblem) for e in received)
-
-
 def test_chosen_devices_are_used_and_a_vanished_device_falls_back_to_the_default(
     gateway, data_dir, transcripts_dir, clock
 ):

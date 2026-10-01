@@ -47,8 +47,10 @@ call fails the Recording is kept and the Live Captions are saved as a **provisio
 select it in the Library and press **Retry** to send the Recording again. The Recording is deleted
 only once a Retry succeeds.
 
-Capture uses the default Windows microphone through WASAPI (see ADR-0001). Device selection is
-a later ticket.
+Sources: **Microphone** (the default Windows microphone) and **System Audio** (whatever the default
+output device is playing, such as a Zoom or Teams call, captured through WASAPI loopback; see
+ADR-0001). System Audio captures the whole output device, so anything else playing through it is
+transcribed too. Device selection is a later ticket.
 
 ## Layout
 

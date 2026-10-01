@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from transcriber.core.app import CaptureChanged
-from transcriber.core.capture import CaptureError, CaptureState
+from transcriber.core.capture import CaptureError, CaptureState, DeviceKind
 from transcriber.core.gateway import TranscriptionError
 from transcriber.core.model import SourceKind, TranscriptStatus
 
@@ -68,6 +68,33 @@ def test_the_source_kind_may_be_given_as_its_plain_string(core):
     transcript = core.stop_capture()
 
     assert transcript.source_kind is SourceKind.MICROPHONE
+
+
+def test_a_system_audio_capture_listens_to_the_loopback_device_and_is_labelled_so(core, gateway, audio, transcripts_dir):
+    core.start_capture(SourceKind.SYSTEM_AUDIO, title="Webinar")
+    assert [d.id for d in audio.opened] == ["fake-loop"]
+    assert gateway.stream.channels == 1
+
+    transcript = core.stop_capture()
+
+    assert transcript.source_kind is SourceKind.SYSTEM_AUDIO
+    assert transcript.rendering_path == transcripts_dir / "2026-09-30 14-05 Webinar.txt"
+    assert transcript.rendering_path.read_text(encoding="utf-8").startswith(
+        "Webinar\n2026-09-30 14:05 · 12 s · System Audio\n"
+    )
+    assert gateway.stream.closed is True
+    assert core.capture_status().state is CaptureState.COMPLETE
+    assert transcript.recording_path is None
+
+
+def test_a_system_audio_capture_is_refused_when_there_is_nothing_to_capture_from(core, audio):
+    audio.devices = [d for d in audio.devices if d.kind is not DeviceKind.LOOPBACK]
+
+    with pytest.raises(CaptureError, match="output device"):
+        core.start_capture(SourceKind.SYSTEM_AUDIO)
+
+    assert core.capture_status().state is CaptureState.IDLE
+    assert audio.opened == []
 
 
 def test_only_one_capture_runs_at_a_time(core, audio):

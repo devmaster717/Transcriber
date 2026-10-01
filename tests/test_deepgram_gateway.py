@@ -14,6 +14,14 @@ from transcriber.deepgram_gateway import DeepgramGateway, to_result
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def test_the_real_gateway_offers_both_operations_of_the_seam():
+    # Guards against a method silently falling out of the class (it happened once).
+    gateway = DeepgramGateway("not-used")
+
+    assert callable(gateway.transcribe)
+    assert callable(gateway.open_stream)
+
+
 def test_deepgram_paragraphs_become_speaker_turns():
     payload = json.loads((FIXTURES / "deepgram_prerecorded.json").read_text(encoding="utf-8"))
 

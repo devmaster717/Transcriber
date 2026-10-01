@@ -149,12 +149,6 @@ class DeepgramGateway:
             raise TranscriptionError("Could not reach Deepgram. Check your connection.") from e
         return _DeepgramStream(context, socket, on_caption, on_error)
 
-
-def _refused(status_code: int | None) -> TranscriptionError:
-    if status_code in (401, 403):
-        return RejectedKeyError("Deepgram rejected the API key.")
-    return TranscriptionError(f"Deepgram refused the live connection ({status_code}).")
-
     def transcribe(self, audio: Path, multichannel: bool = False) -> TranscriptionResult:
         options = dict(PRERECORDED_OPTIONS)
         if multichannel:
@@ -215,3 +209,9 @@ def to_result(response: Any) -> TranscriptionResult:
                 )
             )
     return TranscriptionResult(duration=duration, paragraphs=paragraphs)
+
+
+def _refused(status_code: int | None) -> TranscriptionError:
+    if status_code in (401, 403):
+        return RejectedKeyError("Deepgram rejected the API key.")
+    return TranscriptionError(f"Deepgram refused the live connection ({status_code}).")

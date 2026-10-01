@@ -26,6 +26,25 @@ microphone and which output device to capture (Windows defaults preselected), wh
 transcripts go, and the Rendering defaults. If Deepgram rejects the key, the settings screen opens
 with the reason.
 
+## Build a standalone app
+
+```bash
+uv run python scripts/build.py
+```
+
+This produces `dist/Transcriber/` with `Transcriber.exe` inside, and zips it to
+`dist/Transcriber-<version>-windows.zip`. Unzip anywhere on a Windows machine and run the
+executable; Python is not needed. The build is **unsigned**, so Windows SmartScreen shows
+"Windows protected your PC" the first time: click **More info**, then **Run anyway**.
+
+To confirm a build works on a machine, run its self-check, which exercises the audio devices, a
+short loopback capture, the credential store and both Deepgram request paths (with a bogus key, so
+"rejected" is the expected outcome) and writes a JSON report:
+
+```bash
+dist/Transcriber/Transcriber.exe --self-check report.json
+```
+
 ## Tests
 
 ```bash

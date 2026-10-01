@@ -26,6 +26,19 @@ def test_deepgram_paragraphs_become_speaker_turns():
     ]
 
 
+def test_multichannel_paragraphs_carry_their_channel():
+    payload = json.loads((FIXTURES / "deepgram_prerecorded_multichannel.json").read_text(encoding="utf-8"))
+
+    result = to_result(payload)
+
+    assert result.duration == 20.0
+    assert [(p.channel, p.speaker, p.text) for p in result.paragraphs] == [
+        (0, 0, "Morning everyone, can you hear me?"),
+        (1, 0, "Yes, loud and clear."),
+        (1, 1, "Me too."),
+    ]
+
+
 @pytest.mark.skipif(not os.environ.get("DEEPGRAM_API_KEY"), reason="DEEPGRAM_API_KEY not set")
 def test_real_deepgram_transcribes_the_spoken_fixture():
     gateway = DeepgramGateway(api_key=os.environ["DEEPGRAM_API_KEY"])

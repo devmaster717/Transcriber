@@ -141,11 +141,12 @@ def _refused(status_code: int | None) -> TranscriptionError:
         return RejectedKeyError("Deepgram rejected the API key.")
     return TranscriptionError(f"Deepgram refused the live connection ({status_code}).")
 
-    def transcribe(self, audio: Path) -> TranscriptionResult:
+    def transcribe(self, audio: Path, multichannel: bool = False) -> TranscriptionResult:
+        options = dict(PRERECORDED_OPTIONS)
+        if multichannel:
+            options["multichannel"] = True
         try:
-            response = self._client.listen.v1.media.transcribe_file(
-                request=audio.read_bytes(), **PRERECORDED_OPTIONS
-            )
+            response = self._client.listen.v1.media.transcribe_file(request=audio.read_bytes(), **options)
         except ApiError as e:
             if e.status_code in (401, 403):
                 raise RejectedKeyError("Deepgram rejected the API key.") from e
@@ -168,7 +169,7 @@ def to_result(response: Any) -> TranscriptionResult:
 
     duration = float(payload["metadata"]["duration"])
     paragraphs: list[Paragraph] = []
-    for channel in payload["results"].get("channels") or []:
+    for channel_index, channel in enumerate(payload["results"].get("channels") or []):
         alternatives = channel.get("alternatives") or []
         if not alternatives:
             continue
@@ -182,6 +183,7 @@ def to_result(response: Any) -> TranscriptionResult:
                     end=float(words[-1]["end"]) if words else duration,
                     speaker=0,
                     text=best["transcript"].strip(),
+                    channel=channel_index,
                 )
             )
             continue
@@ -195,6 +197,7 @@ def to_result(response: Any) -> TranscriptionResult:
                     end=float(item.get("end") or 0.0),
                     speaker=int(item.get("speaker") or 0),
                     text=text,
+                    channel=channel_index,
                 )
             )
     return TranscriptionResult(duration=duration, paragraphs=paragraphs)

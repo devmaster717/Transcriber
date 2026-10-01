@@ -34,12 +34,17 @@ class TranscriptStatus(StrEnum):
 
 @dataclass(frozen=True)
 class Paragraph:
-    """One Speaker turn: a stretch of speech attributed to a single Speaker."""
+    """One Speaker turn: a stretch of speech attributed to a single Speaker.
+
+    `channel` is which audio channel it was heard on. In a Meeting Capture channel 0 is the
+    Microphone (the Speaker "You") and channel 1 is System Audio (everyone else).
+    """
 
     start: float
     end: float
     speaker: int
     text: str
+    channel: int = 0
 
 
 def default_speaker_name(speaker: int) -> str:

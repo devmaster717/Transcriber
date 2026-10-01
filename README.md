@@ -47,10 +47,13 @@ call fails the Recording is kept and the Live Captions are saved as a **provisio
 select it in the Library and press **Retry** to send the Recording again. The Recording is deleted
 only once a Retry succeeds.
 
-Sources: **Microphone** (the default Windows microphone) and **System Audio** (whatever the default
-output device is playing, such as a Zoom or Teams call, captured through WASAPI loopback; see
-ADR-0001). System Audio captures the whole output device, so anything else playing through it is
-transcribed too. Device selection is a later ticket.
+Sources: **Meeting Capture** (the default: Microphone and System Audio together, so one Transcript
+covers both sides of a call, with your own words attributed to the Speaker "You"), **Microphone**
+(the default Windows microphone) and **System Audio** (whatever the default output device is
+playing, such as a Zoom or Teams call, captured through WASAPI loopback; see ADR-0001). A Meeting
+Capture records two channels and asks Deepgram for a per-channel transcript. System Audio captures
+the whole output device, so anything else playing through it is transcribed too. Device selection
+is a later ticket.
 
 ## Layout
 

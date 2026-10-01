@@ -55,6 +55,15 @@ Capture records two channels and asks Deepgram for a per-channel transcript. Sys
 the whole output device, so anything else playing through it is transcribed too. Device selection
 is a later ticket.
 
+## Reading, copying and renaming
+
+Above the viewer, **Timestamps** and **Speaker labels** change what is shown without touching the
+Rendering file. **Make default** stores the current toggles so new Rendering files use them.
+**Copy** puts the displayed text on the clipboard. **Rename…** changes a Transcript's title (a
+Capture's Rendering file is renamed to match; a File's keeps the File's name). **Rename speaker…**
+turns "Speaker 2" into a real name everywhere, including the Rendering file. The app keeps the full
+Transcript, so a Rendering can always be regenerated (ADR-0002).
+
 ## Layout
 
 - `src/transcriber/core/`: the headless core. No Qt imports. The public API is `TranscriberCore`.

@@ -36,7 +36,8 @@ from .gateway import (
 from .mixer import ChannelMixer
 from .model import Paragraph, SourceKind, Transcript, TranscriptStatus, default_speaker_name
 from .queue import FileQueue, QueueItem, QueueState
-from .rendering import render
+from .rendering import RenderingOptions, render
+from .settings import Settings, SettingsStore
 from .store import TranscriptStore
 
 Clock = Callable[[], datetime]
@@ -175,6 +176,7 @@ class TranscriberCore:
         self._gateway = gateway
         self._audio = audio_capture
         self._store = TranscriptStore(data_dir)
+        self._settings = SettingsStore(data_dir)
         self._recordings_dir = data_dir / "recordings"
         self._transcripts_dir = transcripts_dir or default_transcripts_dir()
         self._clock = clock
@@ -496,7 +498,65 @@ class TranscriberCore:
         else:
             safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", title).strip(" .")
             name = f"{stamp} {safe}" if safe else stamp
-        return self._transcripts_dir / f"{name}.txt"
+        return self.transcripts_dir() / f"{name}.txt"
+
+    def transcripts_dir(self) -> Path:
+        """Where Capture Renderings go: the settings value if set, else the configured default."""
+        configured = self.settings().transcripts_dir
+        return Path(configured) if configured else self._transcripts_dir
+
+    # ---- Settings ------------------------------------------------------------------------
+
+    def settings(self) -> Settings:
+        return self._settings.load()
+
+    def update_settings(self, **changes) -> Settings:
+        """Change settings. Rendering defaults apply to Renderings written from now on."""
+        return self._settings.update(**changes)
+
+    # ---- Renderings and renaming ---------------------------------------------------------
+
+    def render(self, transcript_id: str, options: RenderingOptions | None = None) -> str:
+        """A one-off Rendering with the given options (defaults from settings). Touches no file."""
+        return render(self._store.load(transcript_id), options or self.settings().rendering_options)
+
+    def rename_speaker(self, transcript_id: str, speaker: int, name: str) -> Transcript:
+        """Give a Speaker a real name. Every paragraph and the Rendering file follow."""
+        transcript = self._store.load(transcript_id)
+        clean = name.strip()
+        if not clean:
+            raise ValueError("A Speaker needs a name.")
+        transcript.speaker_names[speaker] = clean
+        self._save_with_rendering(transcript)
+        return transcript
+
+    def rename_transcript(self, transcript_id: str, title: str) -> Transcript:
+        """Change a Transcript's title. A Capture's Rendering file is renamed; a File's keeps the File's name."""
+        transcript = self._store.load(transcript_id)
+        clean = title.strip()
+        if not clean:
+            raise ValueError("A Transcript needs a title.")
+        transcript.title = clean
+        if transcript.source_path is None and transcript.rendering_path is not None:
+            new_path = self._capture_rendering_path(transcript.created, clean)
+            if new_path != transcript.rendering_path:
+                old_path = transcript.rendering_path
+                transcript.rendering_path = new_path
+                if old_path.exists():
+                    old_path.unlink()
+        self._save_with_rendering(transcript)
+        return transcript
+
+    def _save_with_rendering(self, transcript: Transcript) -> None:
+        if transcript.rendering_path is not None and transcript.status is TranscriptStatus.COMPLETE:
+            self._write_rendering(transcript)
+        self._store.save(transcript)
+        self._emit(TranscriptReady(transcript))
+
+    def _write_rendering(self, transcript: Transcript) -> None:
+        path = transcript.rendering_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render(transcript, self.settings().rendering_options), encoding="utf-8")
 
     # ---- Library -------------------------------------------------------------------------
 
@@ -551,8 +611,7 @@ class TranscriberCore:
             speaker_names=speaker_names,
             rendering_path=rendering_path,
         )
-        rendering_path.parent.mkdir(parents=True, exist_ok=True)
-        rendering_path.write_text(render(transcript), encoding="utf-8")
+        self._write_rendering(transcript)
         self._store.save(transcript)
         self._emit(TranscriptReady(transcript))
         return transcript

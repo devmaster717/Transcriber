@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,9 +19,17 @@ from .capture import (
     CaptureState,
     CaptureStatus,
     DeviceKind,
+    LiveCaptions,
     Recorder,
 )
-from .gateway import MAX_FILE_BYTES, TranscriptionError, TranscriptionGateway, TranscriptionResult
+from .gateway import (
+    MAX_FILE_BYTES,
+    Caption,
+    LiveStream,
+    TranscriptionError,
+    TranscriptionGateway,
+    TranscriptionResult,
+)
 from .model import SourceKind, Transcript, TranscriptStatus, default_speaker_name
 from .queue import FileQueue, QueueItem, QueueState
 from .rendering import render
@@ -50,8 +59,17 @@ class CaptureChanged:
     status: CaptureStatus
 
 
-Event = TranscriptReady | QueueChanged | CaptureChanged
+@dataclass(frozen=True)
+class CaptionsChanged:
+    """The Live Captions changed: a new caption arrived or the connection state flipped."""
+
+    live: LiveCaptions
+
+
+Event = TranscriptReady | QueueChanged | CaptureChanged | CaptionsChanged
 EventHandler = Callable[[Event], None]
+
+RECONNECT_BACKOFF = (0.5, 1.0, 2.0, 4.0, 8.0, 10.0)
 
 
 @dataclass(frozen=True)
@@ -83,7 +101,9 @@ class _ActiveCapture:
     started_at: datetime
     device: AudioDevice
     recorder: Recorder
-    handle: CaptureHandle
+    handle: CaptureHandle | None = None
+    stream: LiveStream | None = None
+    channels: int = 1
 
 
 def default_transcripts_dir() -> Path:
@@ -99,6 +119,7 @@ class TranscriberCore:
         transcripts_dir: Path | None = None,
         clock: Clock = datetime.now,
         max_file_bytes: int = MAX_FILE_BYTES,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self._gateway = gateway
         self._audio = audio_capture
@@ -107,11 +128,14 @@ class TranscriberCore:
         self._transcripts_dir = transcripts_dir or default_transcripts_dir()
         self._clock = clock
         self._max_file_bytes = max_file_bytes
+        self._sleep = sleeper
         self._queue = FileQueue()
         self._handlers: list[EventHandler] = []
         self._capture: _ActiveCapture | None = None
         self._capture_status = CaptureStatus(CaptureState.IDLE)
         self._capture_lock = threading.Lock()
+        self._live = LiveCaptions()
+        self._live_lock = threading.Lock()
 
     def subscribe(self, handler: EventHandler) -> None:
         """Receive every event the core emits. Handlers run on the thread that did the work."""
@@ -205,12 +229,69 @@ class TranscriberCore:
             capture_id = uuid.uuid4().hex
             clean_title = (title or "").strip() or started.strftime("%Y-%m-%d %H:%M")
             recorder = Recorder(self._recordings_dir / f"{capture_id}.wav")
-            handle = self._audio.open(device, recorder.write)
-            self._capture = _ActiveCapture(capture_id, kind, clean_title, started, device, recorder, handle)
+            active = _ActiveCapture(capture_id, kind, clean_title, started, device, recorder)
+            self._capture = active
+            with self._live_lock:
+                self._live = LiveCaptions()
             status = CaptureStatus(CaptureState.CAPTURING, clean_title, started, recorder.path)
             self._capture_status = status
         self._emit(CaptureChanged(status))
+        # Live Captions are best effort: a stream that cannot open now is retried in the background,
+        # and the Recording, which the Transcript comes from, does not depend on it (ADR-0003).
+        try:
+            active.stream = self._gateway.open_stream(self._on_caption, self._on_stream_error, active.channels)
+        except TranscriptionError as e:
+            threading.Thread(target=self._on_stream_error, args=(e.message,), daemon=True).start()
+        active.handle = self._audio.open(device, self._make_chunk_sink(active))
         return status
+
+    def live_captions(self) -> LiveCaptions:
+        with self._live_lock:
+            return self._live
+
+    def _make_chunk_sink(self, active: _ActiveCapture) -> Callable[[bytes], None]:
+        def on_chunk(chunk: bytes) -> None:
+            active.recorder.write(chunk)
+            stream = active.stream
+            if stream is not None:
+                try:
+                    stream.send(chunk)
+                except Exception:  # noqa: BLE001 - the stream reports its own failure through on_error
+                    pass
+
+        return on_chunk
+
+    def _on_caption(self, caption: Caption) -> None:
+        with self._live_lock:
+            self._live = self._live.with_caption(caption)
+            live = self._live
+        self._emit(CaptionsChanged(live))
+
+    def _on_stream_error(self, reason: str) -> None:
+        """The live connection dropped. Keep recording and reopen it with backoff until the Capture stops."""
+        active = self._capture
+        if active is None or self._capture_status.state is not CaptureState.CAPTURING:
+            return
+        active.stream = None
+        self._set_reconnecting(True)
+        attempt = 0
+        while self._capture is active and self._capture_status.state is CaptureState.CAPTURING:
+            self._sleep(RECONNECT_BACKOFF[min(attempt, len(RECONNECT_BACKOFF) - 1)])
+            attempt += 1
+            if self._capture is not active or self._capture_status.state is not CaptureState.CAPTURING:
+                return
+            try:
+                active.stream = self._gateway.open_stream(self._on_caption, self._on_stream_error, active.channels)
+            except TranscriptionError:
+                continue
+            self._set_reconnecting(False)
+            return
+
+    def _set_reconnecting(self, reconnecting: bool) -> None:
+        with self._live_lock:
+            self._live = LiveCaptions(self._live.final, self._live.provisional, reconnecting)
+            live = self._live
+        self._emit(CaptionsChanged(live))
 
     def stop_capture(self) -> Transcript:
         """Stop the running Capture and produce its Transcript from the Recording.
@@ -221,10 +302,17 @@ class TranscriberCore:
             active = self._capture
             if active is None or self._capture_status.state is not CaptureState.CAPTURING:
                 raise CaptureError("No Capture is running.")
-            active.handle.stop()
+            if active.handle is not None:
+                active.handle.stop()
             active.recorder.close()
             status = CaptureStatus(CaptureState.FINALISING, active.title, active.started_at, active.recorder.path)
             self._capture_status = status
+        stream, active.stream = active.stream, None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001 - a connection that is already gone is fine here
+                pass
         self._emit(CaptureChanged(status))
         try:
             result = self._gateway.transcribe(active.recorder.path)

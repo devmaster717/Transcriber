@@ -6,14 +6,25 @@ as fixed by the spec. The core never sees SDK types; everything is mapped to dom
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
 import httpx
 from deepgram import DeepgramClient
 from deepgram.core.api_error import ApiError
+from deepgram.core.events import EventType
+from websockets.exceptions import InvalidStatus
 
-from .core.gateway import RejectedKeyError, TranscriptionError, TranscriptionResult
+from .core.capture import SAMPLE_RATE
+from .core.gateway import (
+    Caption,
+    OnCaption,
+    OnStreamError,
+    RejectedKeyError,
+    TranscriptionError,
+    TranscriptionResult,
+)
 from .core.model import Paragraph
 
 PRERECORDED_OPTIONS: dict[str, Any] = {
@@ -25,10 +36,110 @@ PRERECORDED_OPTIONS: dict[str, Any] = {
     "punctuate": True,
 }
 
+LIVE_OPTIONS: dict[str, Any] = {
+    "model": "nova-3",
+    "language": "en",
+    "encoding": "linear16",
+    "sample_rate": SAMPLE_RATE,
+    "smart_format": True,
+    "diarize": True,
+    "punctuate": True,
+    "interim_results": True,
+}
+
+
+class _DeepgramStream:
+    """One live connection. Listens on its own thread; `send` and `close` come from other threads."""
+
+    def __init__(self, context, socket, on_caption: OnCaption, on_error: OnStreamError) -> None:
+        self._context = context
+        self._socket = socket
+        self._on_caption = on_caption
+        self._on_error = on_error
+        self._closed = False
+        socket.on(EventType.MESSAGE, self._on_message)
+        socket.on(EventType.ERROR, self._on_socket_error)
+        socket.on(EventType.CLOSE, self._on_socket_close)
+        self._thread = threading.Thread(target=self._listen, name="deepgram-live", daemon=True)
+        self._thread.start()
+
+    def _listen(self) -> None:
+        try:
+            self._socket.start_listening()
+        except Exception as e:  # noqa: BLE001 - any listener failure is "the connection is gone"
+            self._report(f"Live connection lost: {e}")
+        finally:
+            try:
+                self._context.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_message(self, message: Any) -> None:
+        if getattr(message, "type", None) != "Results":
+            return
+        alternatives = message.channel.alternatives
+        if not alternatives or not alternatives[0].transcript:
+            return
+        best = alternatives[0]
+        words = best.words or []
+        self._on_caption(
+            Caption(
+                text=best.transcript,
+                is_final=bool(message.is_final),
+                start=float(message.start),
+                speaker=words[0].speaker if words else None,
+                channel=int(message.channel_index[0]) if message.channel_index else 0,
+            )
+        )
+
+    def _on_socket_error(self, error: Any) -> None:
+        self._report(f"Live connection error: {error}")
+
+    def _on_socket_close(self, _: Any) -> None:
+        self._report("Live connection closed.")
+
+    def _report(self, reason: str) -> None:
+        if not self._closed:
+            self._closed = True
+            self._on_error(reason)
+
+    def send(self, chunk: bytes) -> None:
+        if not self._closed:
+            self._socket.send_media(chunk)
+
+    def close(self) -> None:
+        self._closed = True
+        try:
+            self._socket.send_close_stream()
+        except Exception:  # noqa: BLE001 - already gone is fine
+            pass
+        self._thread.join(timeout=3.0)
+
 
 class DeepgramGateway:
     def __init__(self, api_key: str) -> None:
         self._client = DeepgramClient(api_key=api_key)
+
+    def open_stream(self, on_caption: OnCaption, on_error: OnStreamError, channels: int = 1) -> _DeepgramStream:
+        options = dict(LIVE_OPTIONS, channels=channels)
+        if channels > 1:
+            options["multichannel"] = True
+        context = self._client.listen.v1.connect(**options)
+        try:
+            socket = context.__enter__()
+        except ApiError as e:
+            raise _refused(e.status_code) from e
+        except InvalidStatus as e:  # the websockets library's own handshake rejection, which the SDK lets through
+            raise _refused(e.response.status_code) from e
+        except Exception as e:  # noqa: BLE001 - DNS, TLS, socket errors from the websocket layer
+            raise TranscriptionError("Could not reach Deepgram. Check your connection.") from e
+        return _DeepgramStream(context, socket, on_caption, on_error)
+
+
+def _refused(status_code: int | None) -> TranscriptionError:
+    if status_code in (401, 403):
+        return RejectedKeyError("Deepgram rejected the API key.")
+    return TranscriptionError(f"Deepgram refused the live connection ({status_code}).")
 
     def transcribe(self, audio: Path) -> TranscriptionResult:
         try:

@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from transcriber.core.capture import AudioDevice, CaptureHandle, DeviceKind
-from transcriber.core.gateway import TranscriptionError, TranscriptionResult
+from transcriber.core.gateway import Caption, OnCaption, OnStreamError, TranscriptionError, TranscriptionResult
 from transcriber.core.model import Paragraph
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -24,12 +24,36 @@ def canned_result() -> TranscriptionResult:
     )
 
 
+class FakeLiveStream:
+    """A live connection the test drives by hand: deliver captions, or drop it."""
+
+    def __init__(self, on_caption: OnCaption, on_error: OnStreamError, channels: int) -> None:
+        self._on_caption = on_caption
+        self._on_error = on_error
+        self.channels = channels
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def send(self, chunk: bytes) -> None:
+        self.sent.append(chunk)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def deliver(self, caption: Caption) -> None:
+        self._on_caption(caption)
+
+    def drop(self, reason: str = "connection lost") -> None:
+        self._on_error(reason)
+
+
 class FakeTranscriptionGateway:
     """Returns a canned result, or fails on command. Records what it was asked to transcribe.
 
     `fail_with` fails every request; `fail_for[path]` fails just that path. Both are read at
     request time, so a test can clear them to model a retry that succeeds. `request_bytes`
     keeps the content of each file at request time, since a Recording is deleted afterwards.
+    `streams` holds every live stream opened; `fail_open` makes the next N opens raise.
     """
 
     def __init__(self, result: TranscriptionResult | None = None) -> None:
@@ -38,6 +62,8 @@ class FakeTranscriptionGateway:
         self.fail_for: dict[Path, Exception] = {}
         self.requests: list[Path] = []
         self.request_bytes: list[bytes] = []
+        self.streams: list[FakeLiveStream] = []
+        self.fail_open = 0
 
     def transcribe(self, audio: Path) -> TranscriptionResult:
         self.requests.append(audio)
@@ -48,6 +74,18 @@ class FakeTranscriptionGateway:
             raise self.fail_with
         return self.result
 
+    def open_stream(self, on_caption: OnCaption, on_error: OnStreamError, channels: int = 1) -> FakeLiveStream:
+        if self.fail_open > 0:
+            self.fail_open -= 1
+            raise TranscriptionError("Could not reach Deepgram. Check your connection.")
+        stream = FakeLiveStream(on_caption, on_error, channels)
+        self.streams.append(stream)
+        return stream
+
+    @property
+    def stream(self) -> FakeLiveStream:
+        return self.streams[-1]
+
 
 def wav_frames(path: Path) -> bytes:
     with wave.open(str(path), "rb") as w:
@@ -56,17 +94,23 @@ def wav_frames(path: Path) -> bytes:
 
 
 class FakeAudioCapture:
-    """Plays a 16 kHz mono WAV as if it were the device, delivering every chunk before `open` returns."""
+    """Plays a 16 kHz mono WAV as if it were the device.
 
-    def __init__(self, wav: Path = FIXTURES / "hello.wav", chunk_frames: int = 1600) -> None:
+    With `auto_play` every chunk is delivered before `open` returns; without it the test feeds
+    chunks by hand with `deliver`, so it can interleave audio with other events.
+    """
+
+    def __init__(self, wav: Path = FIXTURES / "hello.wav", chunk_frames: int = 1600, auto_play: bool = True) -> None:
         self.frames = wav_frames(wav)
         self.chunk_bytes = chunk_frames * 2
+        self.auto_play = auto_play
         self.devices = [
             AudioDevice(id="fake-mic", name="Fake Microphone", kind=DeviceKind.INPUT),
             AudioDevice(id="fake-loop", name="Fake Speakers [Loopback]", kind=DeviceKind.LOOPBACK),
         ]
         self.opened: list[AudioDevice] = []
         self.stopped = 0
+        self._on_chunk: Callable[[bytes], None] | None = None
 
     def list_devices(self) -> list[AudioDevice]:
         return list(self.devices)
@@ -76,15 +120,30 @@ class FakeAudioCapture:
 
     def open(self, device: AudioDevice, on_chunk: Callable[[bytes], None]) -> CaptureHandle:
         self.opened.append(device)
-        for i in range(0, len(self.frames), self.chunk_bytes):
-            on_chunk(self.frames[i : i + self.chunk_bytes])
+        self._on_chunk = on_chunk
+        if self.auto_play:
+            for i in range(0, len(self.frames), self.chunk_bytes):
+                on_chunk(self.frames[i : i + self.chunk_bytes])
         fake = self
 
         class _Handle:
             def stop(self) -> None:
                 fake.stopped += 1
+                fake._on_chunk = None
 
         return _Handle()
 
+    def deliver(self, chunk: bytes) -> None:
+        assert self._on_chunk is not None, "no capture is open"
+        self._on_chunk(chunk)
 
-__all__ = ["FIXTURES", "FakeAudioCapture", "FakeTranscriptionGateway", "TranscriptionError", "canned_result", "wav_frames"]
+
+__all__ = [
+    "FIXTURES",
+    "FakeAudioCapture",
+    "FakeLiveStream",
+    "FakeTranscriptionGateway",
+    "TranscriptionError",
+    "canned_result",
+    "wav_frames",
+]

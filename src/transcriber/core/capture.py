@@ -15,6 +15,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
+from .gateway import Caption
+
 SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2  # bytes: 16-bit linear PCM
 
@@ -67,6 +69,20 @@ class CaptureStatus:
     started_at: datetime | None = None
     recording_path: Path | None = None
     transcript_id: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveCaptions:
+    """What the screen shows during a Capture. Never the Transcript (ADR-0003)."""
+
+    final: tuple[Caption, ...] = ()
+    provisional: Caption | None = None
+    reconnecting: bool = False
+
+    def with_caption(self, caption: Caption) -> LiveCaptions:
+        if caption.is_final:
+            return LiveCaptions((*self.final, caption), None, self.reconnecting)
+        return LiveCaptions(self.final, caption, self.reconnecting)
 
 
 class Recorder:

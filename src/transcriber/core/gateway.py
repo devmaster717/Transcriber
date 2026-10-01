@@ -6,6 +6,7 @@ tests substitute a fake.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -35,7 +36,36 @@ class TranscriptionResult:
     paragraphs: list[Paragraph]
 
 
+@dataclass(frozen=True)
+class Caption:
+    """One piece of Live Captions text. Provisional captions are replaced; final ones accumulate."""
+
+    text: str
+    is_final: bool
+    start: float
+    speaker: int | None = None
+    channel: int = 0
+
+
+class LiveStream(Protocol):
+    def send(self, chunk: bytes) -> None:
+        """Send 16 kHz int16 PCM. Safe to call from the capture thread."""
+        ...
+
+    def close(self) -> None:
+        """Tell the service the audio is over and release the connection."""
+        ...
+
+
+OnCaption = Callable[[Caption], None]
+OnStreamError = Callable[[str], None]
+
+
 class TranscriptionGateway(Protocol):
     def transcribe(self, audio: Path) -> TranscriptionResult:
         """Transcribe a whole audio file in one request (the pre-recorded operation)."""
+        ...
+
+    def open_stream(self, on_caption: OnCaption, on_error: OnStreamError, channels: int = 1) -> LiveStream:
+        """Open a live connection. Captions and a terminal error arrive on the gateway's own thread."""
         ...

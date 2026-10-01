@@ -7,6 +7,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from datetime import datetime
+from html import escape as html_escape
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
@@ -23,12 +24,14 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QStackedWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from ..core.app import LibraryEntry, TranscriberCore
-from ..core.capture import CaptureError, CaptureState
+from ..core.app import CaptionsChanged, LibraryEntry, TranscriberCore
+from ..core.capture import CaptureError, CaptureState, LiveCaptions
 from ..core.gateway import TranscriptionError
 from ..core.model import SourceKind, Transcript
 from ..core.queue import QueueItem, QueueState
@@ -64,6 +67,12 @@ class CoreWorker(QThread):
             self.failed.emit(e.message)
         except OSError as e:
             self.failed.emit(f"Could not read the file: {e.strerror or e}")
+
+
+class EventBridge(QObject):
+    """Carries core events, which arrive on capture and network threads, onto the Qt thread."""
+
+    event = Signal(object)
 
 
 class QueueWorker(QThread):
@@ -154,14 +163,24 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.library_list, stretch=1)
         left_layout.addLayout(actions)
 
-        # Viewer
+        # Viewer, and the Live Captions panel that replaces it during a Capture
         self.viewer = QPlainTextEdit()
         self.viewer.setReadOnly(True)
         self.viewer.setPlaceholderText("Select a Transcript to read its Rendering.")
+        self.captions_view = QTextEdit()
+        self.captions_view.setReadOnly(True)
+        self.captions_view.setPlaceholderText("Live Captions appear here as Deepgram returns them.")
+        self.right_stack = QStackedWidget()
+        self.right_stack.addWidget(self.viewer)
+        self.right_stack.addWidget(self.captions_view)
+
+        self._bridge = EventBridge(self)
+        self._bridge.event.connect(self._on_core_event)
+        self._core.subscribe(self._bridge.event.emit)
 
         splitter = QSplitter()
         splitter.addWidget(left)
-        splitter.addWidget(self.viewer)
+        splitter.addWidget(self.right_stack)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
 
@@ -196,6 +215,8 @@ class MainWindow(QMainWindow):
         self.source_kind.setEnabled(False)
         self.title_edit.setEnabled(False)
         self.status.setText(f"Capturing {status.title} from the {kind.label}.")
+        self.captions_view.clear()
+        self.right_stack.setCurrentWidget(self.captions_view)
         self._tick()
         self._elapsed_timer.start()
 
@@ -216,8 +237,34 @@ class MainWindow(QMainWindow):
         if started is None:
             return
         elapsed = (datetime.now() - started).total_seconds()
-        self.capture_indicator.setText(f"● Capturing {format_timestamp(max(0.0, elapsed))}")
+        text = f"● Capturing {format_timestamp(max(0.0, elapsed))}"
+        if self._core.live_captions().reconnecting:
+            text += " · reconnecting…"
+        self.capture_indicator.setText(text)
         self.capture_indicator.setStyleSheet("color: firebrick; font-weight: bold;")
+
+    @Slot(object)
+    def _on_core_event(self, event: object) -> None:
+        if isinstance(event, CaptionsChanged):
+            self._show_captions(event.live)
+            if self._core.capture_status().state is CaptureState.CAPTURING:
+                self._tick()
+
+    def _show_captions(self, live: LiveCaptions) -> None:
+        lines = [f"<b>{self._caption_speaker(c.speaker)}:</b> {html_escape(c.text)}" for c in live.final]
+        if live.provisional is not None:
+            lines.append(
+                f'<span style="color: gray;"><i>{self._caption_speaker(live.provisional.speaker)}: '
+                f"{html_escape(live.provisional.text)}</i></span>"
+            )
+        if live.reconnecting:
+            lines.append('<span style="color: firebrick;">Reconnecting to Deepgram… the Recording continues.</span>')
+        self.captions_view.setHtml("<br>".join(lines))
+        self.captions_view.verticalScrollBar().setValue(self.captions_view.verticalScrollBar().maximum())
+
+    @staticmethod
+    def _caption_speaker(speaker: int | None) -> str:
+        return "Speaker" if speaker is None else f"Speaker {speaker + 1}"
 
     @Slot(object)
     def _on_capture_ready(self, transcript: Transcript) -> None:
@@ -238,6 +285,7 @@ class MainWindow(QMainWindow):
         self.title_edit.setEnabled(True)
         self.capture_indicator.setText("")
         self.capture_indicator.setStyleSheet("")
+        self.right_stack.setCurrentWidget(self.viewer)
 
     # ---- Drag and drop -------------------------------------------------------------------
 

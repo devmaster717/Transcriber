@@ -37,9 +37,13 @@ DEEPGRAM_API_KEY=... uv run pytest tests/test_deepgram_gateway.py
 
 ## Capturing
 
-Pick a Source, optionally type a title, and press **Start capture**. Press **Stop** and the
-Recording is sent to Deepgram, the Transcript is written to `Documents/Transcriber/`, and the
-Recording is deleted (see ADR-0002). If the Deepgram call fails the Recording is kept.
+Pick a Source, optionally type a title, and press **Start capture**. While capturing, Live
+Captions stream into the right-hand panel; provisional text is grey and is replaced as Deepgram
+finalises it. If the live connection drops the app reconnects with backoff and says so, and the
+Recording keeps going regardless. Press **Stop** and the Recording is sent to Deepgram, the
+Transcript is written to `Documents/Transcriber/`, and the Recording is deleted (see ADR-0002 and
+ADR-0003: the captions are display-only, the Transcript comes from the Recording). If the Deepgram
+call fails the Recording is kept.
 
 Capture uses the default Windows microphone through WASAPI (see ADR-0001). Device selection is
 a later ticket.

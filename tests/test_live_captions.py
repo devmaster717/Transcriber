@@ -80,6 +80,31 @@ def test_a_long_silence_ends_the_line_even_without_punctuation(core, gateway):
     assert [c.text for c in core.live_captions().final] == ["So what I meant was", "Anyway, moving on."]
 
 
+def test_continuous_speech_without_pauses_breaks_lines_only_at_sentence_boundaries(core, gateway):
+    """A lecturer reading without pausing never triggers speech_final, yet lines must not break mid-sentence."""
+    core.start_capture(SourceKind.MICROPHONE)
+    s = gateway.stream
+    segments = [
+        "Did it know what counted as a good output? These are the types of",
+        "questions you should always be asking. You're not just judging the",
+        "final output. You're diagnosing the entire setup. Once you've identified",
+        "what went wrong, you can adjust the instructions, provide better context,",
+        "narrow the workspace, or clarify the output format and run the task",
+        "again. Agents are great at repeating this loop quickly. And that's the",
+        "best way to improve their output. Often, you cannot perfectly diagnose",
+    ]
+    for i, text in enumerate(segments):
+        s.deliver(Caption(text, True, float(i * 3), speaker=0))
+
+    live = core.live_captions()
+    lines = [c.text for c in live.final]
+    assert len(lines) >= 3
+    for line in lines[:-1]:
+        assert line.rstrip().endswith((".", "?", "!")), f"line breaks mid-sentence: {line!r}"
+    assert lines[-1].endswith("Often, you cannot perfectly diagnose")
+    assert " ".join(lines) == " ".join(segments)
+
+
 def test_a_line_that_never_gets_punctuation_is_still_cut_at_a_readable_length(core, gateway):
     core.start_capture(SourceKind.MICROPHONE)
     s = gateway.stream

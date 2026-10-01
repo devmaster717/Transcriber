@@ -73,13 +73,40 @@ class CaptureStatus:
     kind: SourceKind | None = None
 
 
-MAX_LINE_CHARS = 240  # a line of Live Captions that never gets punctuation is still cut at a readable length
+SOFT_LINE_CHARS = 100  # past this, a line is closed at its last sentence boundary
+MAX_LINE_CHARS = 240  # a line that never gets any punctuation is still cut at a readable length
 SENTENCE_END = (".", "?", "!", "。", "？", "！")
 
 
 def _sentence_done(text: str, paused: bool) -> bool:
     """A line is complete when the service noticed a pause and the text ends like a sentence."""
     return paused and text.rstrip().endswith(SENTENCE_END)
+
+
+def _lay_out(text: str) -> tuple[str, str]:
+    """Split a line that has grown long: the head ends at its last sentence boundary, the tail carries on.
+
+    Continuous speech never triggers the service's pause signal, so without this a line would only
+    ever end at the hard cap, mid-sentence. Returns (head, tail); an empty tail means no split.
+    """
+    if len(text) <= SOFT_LINE_CHARS:
+        return text, ""
+    boundary = -1
+    for i, ch in enumerate(text):
+        if ch in SENTENCE_END and (i + 1 == len(text) or text[i + 1] == " "):
+            boundary = i
+    if 0 <= boundary < len(text) - 1:
+        return text[: boundary + 1].rstrip(), text[boundary + 1 :].strip()
+    if boundary == -1 and len(text) > MAX_LINE_CHARS:
+        cut = text.rfind(" ", 0, MAX_LINE_CHARS)
+        if cut > 0:
+            return text[:cut].rstrip(), text[cut:].strip()
+    return text, ""
+
+
+def _line_closed(text: str, paused: bool) -> bool:
+    """Closed on a pause after a sentence, or once a long line ends with a sentence (no pause needed)."""
+    return _sentence_done(text, paused) or (len(text) > SOFT_LINE_CHARS and text.rstrip().endswith(SENTENCE_END))
 
 
 @dataclass(frozen=True)
@@ -125,28 +152,42 @@ class LiveCaptions:
         last = self.final[-1] if self.final else None
         if last is not None and self._continues(last, caption):
             text = f"{last.text} {caption.text}".strip()
-            merged = Caption(
+            line = Caption(
                 text=text,
                 is_final=True,
                 start=last.start,
                 speaker=last.speaker if last.speaker is not None else caption.speaker,
                 channel=last.channel,
                 ends_utterance=caption.ends_utterance,
-                closed=_sentence_done(text, caption.ends_utterance),
             )
-            return replace(self, final=(*self.final[:-1], merged), provisional=None)
-        opened = replace(caption, closed=_sentence_done(caption.text, caption.ends_utterance))
-        return replace(self, final=(*self.final, opened), provisional=None)
+            kept = self.final[:-1]
+        else:
+            line = caption
+            kept = self.final
+        return replace(self, final=(*kept, *self._lines_from(line, caption)), provisional=None)
+
+    @staticmethod
+    def _lines_from(line: Caption, new: Caption) -> list[Caption]:
+        """Lay a (possibly merged) line out as closed lines plus an open tail, breaking only at sentences."""
+        out: list[Caption] = []
+        text = line.text
+        start = line.start
+        while True:
+            head, tail = _lay_out(text)
+            out.append(
+                replace(line, text=head, start=start, closed=bool(tail) or _line_closed(head, new.ends_utterance))
+            )
+            if not tail:
+                return out
+            text, start = tail, new.start
 
     def _continues(self, last: Caption, new: Caption) -> bool:
-        """A new segment extends the open line if the same voice is still speaking and the line has room.
+        """A new segment extends the open line if the same voice is still speaking.
 
         The service flags a pause (`ends_utterance`) on almost every segment with some speakers, so a
-        pause alone does not end a line; a pause after a complete sentence does (see `_sentence_done`).
+        pause alone does not end a line; a pause after a complete sentence does (see `_line_closed`).
         """
         if last.closed or last.channel != new.channel:
-            return False
-        if len(last.text) + 1 + len(new.text) > MAX_LINE_CHARS:
             return False
         if last.channel in self.single_voice_channels:
             return True

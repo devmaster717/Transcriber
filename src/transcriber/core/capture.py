@@ -60,6 +60,7 @@ class CaptureState(StrEnum):
     CAPTURING = "capturing"
     FINALISING = "finalising"
     COMPLETE = "complete"
+    NEEDS_RETRY = "needs_retry"  # the finalising pass failed; the Recording is kept for a Retry
 
 
 @dataclass(frozen=True)

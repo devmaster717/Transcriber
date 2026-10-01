@@ -72,6 +72,12 @@ EventHandler = Callable[[Event], None]
 
 RECONNECT_BACKOFF = (0.5, 1.0, 2.0, 4.0, 8.0, 10.0)
 
+# Which device each single-Source Capture kind listens to. Meeting Capture (both at once) is #9.
+CAPTURE_DEVICE_KINDS = {
+    SourceKind.MICROPHONE: DeviceKind.INPUT,
+    SourceKind.SYSTEM_AUDIO: DeviceKind.LOOPBACK,
+}
+
 
 @dataclass(frozen=True)
 class LibraryEntry:
@@ -234,16 +240,21 @@ class TranscriberCore:
         kind = SourceKind(kind)
         if self._audio is None:
             raise CaptureError("Audio capture is not available on this platform.")
-        if kind is not SourceKind.MICROPHONE:
+        if kind not in CAPTURE_DEVICE_KINDS:
             raise CaptureError(f"{kind.label} capture is not available yet.")
         with self._capture_lock:
             if self._capture_status.state in (CaptureState.CAPTURING, CaptureState.FINALISING):
                 raise CaptureError("A Capture is already running.")
             # A Capture in needs_retry lives on as a provisional Transcript and is retried from the Library,
             # so it does not block a new one.
-            device = self._audio.default_device(DeviceKind.INPUT)
+            device_kind = CAPTURE_DEVICE_KINDS[kind]
+            device = self._audio.default_device(device_kind)
             if device is None:
-                raise CaptureError("No microphone was found.")
+                raise CaptureError(
+                    "No microphone was found."
+                    if device_kind is DeviceKind.INPUT
+                    else "No output device was found to capture System Audio from."
+                )
             started = self._clock()
             capture_id = uuid.uuid4().hex
             clean_title = (title or "").strip() or started.strftime("%Y-%m-%d %H:%M")

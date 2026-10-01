@@ -112,6 +112,7 @@ class MainWindow(QMainWindow):
         # Capture controls
         self.source_kind = QComboBox()
         self.source_kind.addItem(SourceKind.MICROPHONE.label, SourceKind.MICROPHONE)
+        self.source_kind.addItem(SourceKind.SYSTEM_AUDIO.label, SourceKind.SYSTEM_AUDIO)
         self.title_edit = QLineEdit()
         self.title_edit.setPlaceholderText("Title (optional)")
         self.capture_button = QPushButton("Start capture")

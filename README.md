@@ -43,7 +43,9 @@ finalises it. If the live connection drops the app reconnects with backoff and s
 Recording keeps going regardless. Press **Stop** and the Recording is sent to Deepgram, the
 Transcript is written to `Documents/Transcriber/`, and the Recording is deleted (see ADR-0002 and
 ADR-0003: the captions are display-only, the Transcript comes from the Recording). If the Deepgram
-call fails the Recording is kept.
+call fails the Recording is kept and the Live Captions are saved as a **provisional** Transcript;
+select it in the Library and press **Retry** to send the Recording again. The Recording is deleted
+only once a Retry succeeds.
 
 Capture uses the default Windows microphone through WASAPI (see ADR-0001). Device selection is
 a later ticket.

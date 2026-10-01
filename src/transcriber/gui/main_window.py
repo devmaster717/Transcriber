@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 from ..core.app import CaptionsChanged, LibraryEntry, TranscriberCore
 from ..core.capture import CaptureError, CaptureState, LiveCaptions
 from ..core.gateway import TranscriptionError
-from ..core.model import SourceKind, Transcript
+from ..core.model import SourceKind, Transcript, TranscriptStatus
 from ..core.queue import QueueItem, QueueState
 from ..core.rendering import format_duration, format_timestamp, render
 
@@ -271,7 +271,13 @@ class MainWindow(QMainWindow):
         self._reset_capture_controls()
         self.title_edit.clear()
         self.refresh_library(select_id=transcript.id)
-        self.status.setText(f"Saved to {transcript.rendering_path}")
+        if transcript.status is TranscriptStatus.PROVISIONAL:
+            self.status.setText(
+                "Deepgram could not transcribe the Recording, so it was kept. "
+                "The Live Captions are shown as a provisional Transcript; press Retry when you are back online."
+            )
+        else:
+            self.status.setText(f"Saved to {transcript.rendering_path}")
 
     @Slot(str)
     def _on_capture_failed(self, message: str) -> None:
@@ -393,12 +399,16 @@ class MainWindow(QMainWindow):
             summary = " · ".join(
                 [t.created.strftime("%Y-%m-%d %H:%M"), format_duration(t.duration), t.source_kind.label]
             )
+            if t.status is TranscriptStatus.PROVISIONAL:
+                summary += " · provisional"
             if entry.missing_files:
                 summary += " · not found"
             row = QListWidgetItem(f"{t.title}\n{summary}")
             row.setData(ID_ROLE, t.id)
             if entry.missing_files:
                 row.setForeground(QColor("gray"))
+            elif t.status is TranscriptStatus.PROVISIONAL:
+                row.setForeground(QColor("darkorange"))
             self.library_list.addItem(row)
         self.library_list.blockSignals(False)
         for i in range(self.library_list.count()):
@@ -423,9 +433,11 @@ class MainWindow(QMainWindow):
 
     def _show_entry(self, entry: LibraryEntry | None) -> None:
         has_entry = entry is not None
-        self.open_folder_button.setEnabled(has_entry)
-        self.open_file_button.setEnabled(has_entry and entry.rendering_found)
-        self.retranscribe_button.setEnabled(has_entry and entry.source_found)
+        provisional = has_entry and entry.transcript.status is TranscriptStatus.PROVISIONAL
+        self.open_folder_button.setEnabled(has_entry and entry.transcript.rendering_path is not None)
+        self.open_file_button.setEnabled(has_entry and entry.rendering_found and entry.transcript.rendering_path is not None)
+        self.retranscribe_button.setText("Retry" if provisional else "Re-transcribe")
+        self.retranscribe_button.setEnabled(has_entry and entry.can_retranscribe)
         self.remove_button.setEnabled(has_entry)
         if entry is None:
             self.viewer.clear()
@@ -436,8 +448,14 @@ class MainWindow(QMainWindow):
             missing.append("Rendering file not found")
         if not entry.source_found:
             missing.append("source file not found")
+        if not entry.recording_found:
+            missing.append("Recording not found, so it cannot be retried")
         if missing:
             self.status.setText(", ".join(missing).capitalize() + ". The Transcript is still kept by the app.")
+        elif provisional:
+            self.status.setText(
+                "Provisional: this is what the Live Captions heard. Press Retry to send the kept Recording to Deepgram."
+            )
         else:
             self.status.setText(f"{entry.transcript.rendering_path}")
 
@@ -446,8 +464,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def _retranscribe(self) -> None:
         entry = self.selected_entry()
-        if entry is not None:
-            self._run(f"Re-transcribing {entry.transcript.title}…", lambda: self._core.retranscribe(entry.transcript.id))
+        if entry is None:
+            return
+        verb = "Retrying" if entry.transcript.status is TranscriptStatus.PROVISIONAL else "Re-transcribing"
+        self._run(f"{verb} {entry.transcript.title}…", lambda: self._core.retranscribe(entry.transcript.id))
 
     @Slot()
     def _remove(self) -> None:
@@ -495,7 +515,10 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_ready(self, transcript: Transcript) -> None:
         self.refresh_library(select_id=transcript.id)
-        self.status.setText(f"Saved to {transcript.rendering_path}")
+        if transcript.status is TranscriptStatus.PROVISIONAL:
+            self.status.setText("Still could not reach Deepgram. The Recording is kept; try again later.")
+        else:
+            self.status.setText(f"Saved to {transcript.rendering_path}")
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:

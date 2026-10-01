@@ -21,6 +21,7 @@ from .capture import (
     DeviceKind,
     LiveCaptions,
     Recorder,
+    SAMPLE_RATE,
 )
 from .gateway import (
     MAX_FILE_BYTES,
@@ -30,7 +31,7 @@ from .gateway import (
     TranscriptionGateway,
     TranscriptionResult,
 )
-from .model import SourceKind, Transcript, TranscriptStatus, default_speaker_name
+from .model import Paragraph, SourceKind, Transcript, TranscriptStatus, default_speaker_name
 from .queue import FileQueue, QueueItem, QueueState
 from .rendering import render
 from .store import TranscriptStore
@@ -79,10 +80,19 @@ class LibraryEntry:
     transcript: Transcript
     rendering_found: bool
     source_found: bool
+    recording_found: bool = True
 
     @property
     def missing_files(self) -> bool:
-        return not (self.rendering_found and self.source_found)
+        return not (self.rendering_found and self.source_found and self.recording_found)
+
+    @property
+    def can_retranscribe(self) -> bool:
+        """A File with its source present, or a provisional Capture whose Recording is still on disk."""
+        t = self.transcript
+        if t.source_path is not None:
+            return self.source_found
+        return t.status is TranscriptStatus.PROVISIONAL and t.recording_path is not None and self.recording_found
 
     @classmethod
     def for_transcript(cls, t: Transcript) -> LibraryEntry:
@@ -90,6 +100,7 @@ class LibraryEntry:
             transcript=t,
             rendering_found=t.rendering_path is None or t.rendering_path.exists(),
             source_found=t.source_path is None or t.source_path.exists(),
+            recording_found=t.recording_path is None or t.recording_path.exists(),
         )
 
 
@@ -160,11 +171,17 @@ class TranscriberCore:
         return self._transcribe_source(uuid.uuid4().hex, path)
 
     def retranscribe(self, transcript_id: str) -> Transcript:
-        """Send a File Transcript's source through the gateway again, replacing the Transcript in place."""
+        """Run the gateway again for a Transcript, replacing it in place.
+
+        For a File Transcript that means the source File. For a provisional Capture Transcript
+        it means the kept Recording (a Retry of the finalising pass).
+        """
         previous = self._store.load(transcript_id)
-        if previous.source_path is None:
-            raise ValueError("Only a File Transcript can be re-transcribed; a Capture's Recording is gone.")
-        return self._transcribe_source(previous.id, previous.source_path)
+        if previous.source_path is not None:
+            return self._transcribe_source(previous.id, previous.source_path)
+        if previous.status is TranscriptStatus.PROVISIONAL and previous.recording_path is not None:
+            return self._retry_capture(previous)
+        raise ValueError("A completed Capture cannot be re-transcribed; its Recording is gone (ADR-0002).")
 
     # ---- File queue ----------------------------------------------------------------------
 
@@ -222,6 +239,8 @@ class TranscriberCore:
         with self._capture_lock:
             if self._capture_status.state in (CaptureState.CAPTURING, CaptureState.FINALISING):
                 raise CaptureError("A Capture is already running.")
+            # A Capture in needs_retry lives on as a provisional Transcript and is retried from the Library,
+            # so it does not block a new one.
             device = self._audio.default_device(DeviceKind.INPUT)
             if device is None:
                 raise CaptureError("No microphone was found.")
@@ -317,27 +336,86 @@ class TranscriberCore:
         try:
             result = self._gateway.transcribe(active.recorder.path)
         except TranscriptionError:
+            provisional = self._save_provisional(active)
             with self._capture_lock:
                 self._capture = None
-                self._capture_status = CaptureStatus(CaptureState.IDLE)
+                self._capture_status = CaptureStatus(
+                    CaptureState.NEEDS_RETRY, active.title, active.started_at, active.recorder.path, provisional.id
+                )
             self._emit(CaptureChanged(self._capture_status))
-            raise
-        transcript = self._finish(
-            transcript_id=active.id,
-            title=active.title,
-            kind=active.kind,
-            source_path=None,
-            rendering_path=self._capture_rendering_path(active.started_at, active.title),
-            result=result,
-        )
-        active.recorder.path.unlink(missing_ok=True)
+            return provisional
+        transcript = self._complete_capture(active.id, active.title, active.kind, active.started_at, active.recorder.path, result)
         with self._capture_lock:
             self._capture = None
-            self._capture_status = CaptureStatus(
-                CaptureState.COMPLETE, active.title, active.started_at, transcript_id=transcript.id
-            )
+        return transcript
+
+    def _complete_capture(
+        self, transcript_id: str, title: str, kind: SourceKind, started_at: datetime, recording: Path, result: TranscriptionResult
+    ) -> Transcript:
+        """The finalising pass succeeded: write the Transcript and Rendering, then delete the Recording (ADR-0002)."""
+        transcript = self._finish(
+            transcript_id=transcript_id,
+            title=title,
+            kind=kind,
+            source_path=None,
+            rendering_path=self._capture_rendering_path(started_at, title),
+            result=result,
+            created=started_at,
+        )
+        recording.unlink(missing_ok=True)
+        with self._capture_lock:
+            self._capture_status = CaptureStatus(CaptureState.COMPLETE, title, started_at, transcript_id=transcript.id)
         self._emit(CaptureChanged(self._capture_status))
         return transcript
+
+    def _save_provisional(self, active: _ActiveCapture) -> Transcript:
+        """Keep what the Live Captions heard as a provisional Transcript, so the user has something to read."""
+        live = self.live_captions()
+        paragraphs = [
+            Paragraph(start=c.start, end=c.start, speaker=c.speaker or 0, text=c.text) for c in live.final
+        ]
+        speakers = sorted({p.speaker for p in paragraphs})
+        transcript = Transcript(
+            id=active.id,
+            title=active.title,
+            created=active.started_at,
+            duration=active.recorder.frames / SAMPLE_RATE,
+            source_kind=active.kind,
+            source_path=None,
+            paragraphs=paragraphs,
+            speaker_names={s: default_speaker_name(s) for s in speakers},
+            status=TranscriptStatus.PROVISIONAL,
+            rendering_path=None,
+            recording_path=active.recorder.path,
+        )
+        self._store.save(transcript)
+        self._emit(TranscriptReady(transcript))
+        return transcript
+
+    def _retry_capture(self, provisional: Transcript) -> Transcript:
+        """Re-run the finalising pass over a kept Recording. On failure the provisional Transcript stands."""
+        recording = provisional.recording_path
+        if recording is None or not recording.exists():
+            raise CaptureError("The Recording for this Capture is no longer on disk.")
+        with self._capture_lock:
+            if self._capture_status.state in (CaptureState.CAPTURING, CaptureState.FINALISING):
+                raise CaptureError("A Capture is already running.")
+            self._capture_status = CaptureStatus(
+                CaptureState.FINALISING, provisional.title, provisional.created, recording, provisional.id
+            )
+        self._emit(CaptureChanged(self._capture_status))
+        try:
+            result = self._gateway.transcribe(recording)
+        except TranscriptionError:
+            with self._capture_lock:
+                self._capture_status = CaptureStatus(
+                    CaptureState.NEEDS_RETRY, provisional.title, provisional.created, recording, provisional.id
+                )
+            self._emit(CaptureChanged(self._capture_status))
+            return provisional
+        return self._complete_capture(
+            provisional.id, provisional.title, provisional.source_kind, provisional.created, recording, result
+        )
 
     def _capture_rendering_path(self, started: datetime, title: str) -> Path:
         stamp = started.strftime("%Y-%m-%d %H-%M")
@@ -386,13 +464,14 @@ class TranscriberCore:
         source_path: Path | None,
         rendering_path: Path,
         result: TranscriptionResult,
+        created: datetime | None = None,
     ) -> Transcript:
         """Turn a gateway result into a persisted Transcript with its Rendering written."""
         speakers = sorted({p.speaker for p in result.paragraphs})
         transcript = Transcript(
             id=transcript_id,
             title=title,
-            created=self._clock(),
+            created=created or self._clock(),
             duration=result.duration,
             source_kind=kind,
             source_path=source_path,

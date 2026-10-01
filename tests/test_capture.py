@@ -5,7 +5,7 @@ import pytest
 from transcriber.core.app import CaptureChanged
 from transcriber.core.capture import CaptureError, CaptureState
 from transcriber.core.gateway import TranscriptionError
-from transcriber.core.model import SourceKind
+from transcriber.core.model import SourceKind, TranscriptStatus
 
 from .fakes import FIXTURES, wav_frames
 
@@ -54,11 +54,11 @@ def test_the_recording_survives_a_failed_finalising_pass(core, gateway):
     core.start_capture(SourceKind.MICROPHONE)
     recording = core.capture_status().recording_path
 
-    with pytest.raises(TranscriptionError):
-        core.stop_capture()
+    provisional = core.stop_capture()
 
     assert recording.exists()
-    assert core.library() == []
+    assert provisional.status is TranscriptStatus.PROVISIONAL
+    assert core.capture_status().state is CaptureState.NEEDS_RETRY
 
 
 def test_the_source_kind_may_be_given_as_its_plain_string(core):

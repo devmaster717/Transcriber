@@ -10,8 +10,8 @@ from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QByteArray, QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -113,12 +113,17 @@ class MainWindow(QMainWindow):
         self.open_button.clicked.connect(self._choose_files)
         self.settings_button = QPushButton("Settings…")
         self.settings_button.clicked.connect(lambda: self.open_settings())
+        self.always_on_top_button = QPushButton("Always on top")
+        self.always_on_top_button.setCheckable(True)
+        self.always_on_top_button.setToolTip("Keep this window, and the Live Captions, above the call you are in")
+        self.always_on_top_button.toggled.connect(self._set_always_on_top)
         self.status = QLabel("Open audio files, or drop them onto this window.")
         self.status.setWordWrap(True)
         self._settings_dialog: SettingsDialog | None = None
         top = QHBoxLayout()
         top.addWidget(self.open_button)
         top.addWidget(self.settings_button)
+        top.addWidget(self.always_on_top_button)
         top.addWidget(self.status, stretch=1)
 
         # Capture controls
@@ -236,8 +241,40 @@ class MainWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
 
-        self.refresh_library()
         self.refresh_queue()
+        self._restore_window_state()
+
+    # ---- Window state --------------------------------------------------------------------
+
+    def _restore_window_state(self) -> None:
+        """Size, position, always-on-top and the last selected Library entry, from the settings document."""
+        state = self._core.settings().window or {}
+        geometry = state.get("geometry")
+        if geometry:
+            self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+        self.always_on_top_button.setChecked(bool(state.get("always_on_top")))
+        self.refresh_library(select_id=state.get("selected") or "")
+
+    def _save_window_state(self) -> None:
+        self._core.update_settings(
+            window={
+                "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+                "always_on_top": self.always_on_top_button.isChecked(),
+                "selected": self.selected_id(),
+            }
+        )
+
+    @Slot(bool)
+    def _set_always_on_top(self, on: bool) -> None:
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)  # this hides the window as a side effect
+        if was_visible:
+            self.show()
+        self._save_window_state()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt override)
+        self._save_window_state()
+        super().closeEvent(event)
 
     # ---- Capture -------------------------------------------------------------------------
 

@@ -14,6 +14,10 @@ class QueueState(StrEnum):
     TRANSCRIBING = "transcribing"
     DONE = "done"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+FINISHED_STATES = (QueueState.DONE, QueueState.FAILED, QueueState.CANCELLED)
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,18 @@ class FileQueue:
             updated = replace(item, **changes)
             self._items[self._items.index(item)] = updated
             return updated
+
+    def remove(self, item_id: str) -> QueueItem:
+        with self._lock:
+            item = self._find(item_id)
+            self._items.remove(item)
+            return item
+
+    def remove_finished(self) -> list[QueueItem]:
+        with self._lock:
+            gone = [i for i in self._items if i.state in FINISHED_STATES]
+            self._items = [i for i in self._items if i.state not in FINISHED_STATES]
+            return gone
 
     def _find(self, item_id: str) -> QueueItem:
         for item in self._items:

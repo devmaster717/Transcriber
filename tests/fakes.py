@@ -65,16 +65,24 @@ class FakeTranscriptionGateway:
         self.multichannel_requests: list[bool] = []
         self.streams: list[FakeLiveStream] = []
         self.fail_open = 0
+        self.during_request: Callable[[], None] | None = None  # runs while a request is "in flight"
+        self.cancel_calls = 0
 
     def transcribe(self, audio: Path, multichannel: bool = False) -> TranscriptionResult:
         self.requests.append(audio)
         self.request_bytes.append(audio.read_bytes())
         self.multichannel_requests.append(multichannel)
+        if self.during_request is not None:
+            self.during_request()
         if audio in self.fail_for:
             raise self.fail_for[audio]
         if self.fail_with is not None:
             raise self.fail_with
         return self.result
+
+    def cancel(self) -> None:
+        """Abort the request in flight. The fake just records it; the real one closes the HTTP client."""
+        self.cancel_calls += 1
 
     def open_stream(self, on_caption: OnCaption, on_error: OnStreamError, channels: int = 1) -> FakeLiveStream:
         if self.fail_open > 0:

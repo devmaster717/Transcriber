@@ -26,6 +26,7 @@ from .capture import (
 from .credentials import CredentialStore, NoCredentialStore
 from .gateway import (
     MAX_FILE_BYTES,
+    CancelledError,
     Caption,
     KeyProblem,
     LiveStream,
@@ -199,6 +200,7 @@ class TranscriberCore:
         self._max_file_bytes = max_file_bytes
         self._sleep = sleeper
         self._queue = FileQueue()
+        self._cancelled: set[str] = set()
         self._handlers: list[EventHandler] = []
         self._capture: _ActiveCapture | None = None
         self._capture_status = CaptureStatus(CaptureState.IDLE)
@@ -216,17 +218,18 @@ class TranscriberCore:
 
     # ---- Files ---------------------------------------------------------------------------
 
-    def transcribe_file(self, path: Path) -> Transcript:
+    def transcribe_file(self, path: Path, discard_if: Callable[[], bool] | None = None) -> Transcript:
         """Transcribe a File Source, persist the Transcript, and return it.
 
         A File that already has a complete Transcript is not sent again; the existing
-        Transcript is returned. Use `retranscribe` to force a fresh one.
+        Transcript is returned. Use `retranscribe` to force a fresh one. `discard_if` is
+        consulted after the gateway answers: if true, nothing is saved and CancelledError is raised.
         """
         existing = self._find_complete_for_source(path)
         if existing is not None:
             self._emit(TranscriptReady(existing))
             return existing
-        return self._transcribe_source(uuid.uuid4().hex, path)
+        return self._transcribe_source(uuid.uuid4().hex, path, discard_if)
 
     def retranscribe(self, transcript_id: str) -> Transcript:
         """Send a File Transcript's source through the gateway again, replacing the Transcript in place.
@@ -260,7 +263,9 @@ class TranscriberCore:
             return None
         self._emit(QueueChanged(item))
         try:
-            transcript = self.transcribe_file(item.path)
+            transcript = self.transcribe_file(item.path, discard_if=lambda: item.id in self._cancelled)
+        except CancelledError:
+            item = self._queue.update(item.id, state=QueueState.CANCELLED, error=None)
         except TranscriptionError as e:
             item = self._queue.update(item.id, state=QueueState.FAILED, error=e.message)
             self._note_key_problem(e)
@@ -268,6 +273,7 @@ class TranscriberCore:
             item = self._queue.update(item.id, state=QueueState.FAILED, error=f"Could not read the file: {e.strerror or e}")
         else:
             item = self._queue.update(item.id, state=QueueState.DONE, transcript_id=transcript.id)
+        self._cancelled.discard(item.id)
         self._emit(QueueChanged(item))
         return item
 
@@ -276,6 +282,22 @@ class TranscriberCore:
         item = self._queue.update(item_id, state=QueueState.WAITING, error=None)
         self._emit(QueueChanged(item))
         return item
+
+    def cancel(self, item_id: str) -> None:
+        """Take a File out of the queue. The one being transcribed is aborted and its result discarded."""
+        item = self._queue.get(item_id)
+        if item.state is QueueState.TRANSCRIBING:
+            self._cancelled.add(item_id)
+            abort = getattr(self._gateway, "cancel", None)
+            if callable(abort):
+                abort()
+            return  # process_next marks it cancelled once the request lets go
+        self._emit(QueueChanged(replace(self._queue.remove(item_id), state=QueueState.CANCELLED)))
+
+    def clear_finished(self) -> None:
+        """Drop every done, failed or cancelled item from the queue."""
+        for item in self._queue.remove_finished():
+            self._emit(QueueChanged(item))
 
     # ---- Capture -------------------------------------------------------------------------
 
@@ -565,11 +587,15 @@ class TranscriberCore:
 
     # ---- Internals -----------------------------------------------------------------------
 
-    def _transcribe_source(self, transcript_id: str, path: Path) -> Transcript:
+    def _transcribe_source(
+        self, transcript_id: str, path: Path, discard_if: Callable[[], bool] | None = None
+    ) -> Transcript:
         if path.stat().st_size > self._max_file_bytes:
             raise TranscriptionError("File is larger than Deepgram's 2 GB limit.")
         self._require_api_key()
         result = self._gateway.transcribe(path)
+        if discard_if is not None and discard_if():
+            raise CancelledError("Cancelled.")
         return self._finish(
             transcript_id=transcript_id,
             title=path.stem,

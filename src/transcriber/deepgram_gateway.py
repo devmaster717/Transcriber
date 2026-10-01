@@ -19,6 +19,7 @@ from websockets.exceptions import InvalidStatus
 
 from .core.capture import SAMPLE_RATE
 from .core.gateway import (
+    CancelledError,
     Caption,
     MissingKeyError,
     OnCaption,
@@ -133,11 +134,19 @@ class _DeepgramStream:
 KeyProvider = Callable[[], str | None]
 
 
+PRERECORDED_URL = "https://api.deepgram.com/v1/listen"
+UPLOAD_CHUNK_BYTES = 1 << 20  # the upload is streamed so a cancel can stop it between chunks
+# Reads wait for Deepgram to process a long file (minutes). Writes are one chunk each and should
+# never stall; a short write timeout is what lets a cancel interrupt a blocked upload.
+PRERECORDED_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+
+
 class DeepgramGateway:
     """Reads the API key through `key_provider` at request time, so a key saved in Settings takes effect at once."""
 
     def __init__(self, key_provider: KeyProvider | str) -> None:
         self._key_provider: KeyProvider = (lambda: key_provider) if isinstance(key_provider, str) else key_provider
+        self._cancel_requested = False
 
     @property
     def _client(self) -> DeepgramClient:
@@ -145,6 +154,16 @@ class DeepgramGateway:
         if not key:
             raise MissingKeyError("No Deepgram API key. Enter one in Settings.")
         return DeepgramClient(api_key=key)
+
+    def cancel(self) -> None:
+        """Ask the pre-recorded request in flight to stop.
+
+        The upload is streamed in chunks that check this flag, so a cancel during the upload stops
+        it within a chunk. Once the upload is complete and Deepgram is processing, the request runs
+        to its end and the core discards the result. (Closing the HTTP client from another thread
+        was tried first: it blocks.)
+        """
+        self._cancel_requested = True
 
     def open_stream(self, on_caption: OnCaption, on_error: OnStreamError, channels: int = 1) -> _DeepgramStream:
         options = dict(LIVE_OPTIONS, channels=channels)
@@ -162,18 +181,64 @@ class DeepgramGateway:
         return _DeepgramStream(context, socket, on_caption, on_error)
 
     def transcribe(self, audio: Path, multichannel: bool = False) -> TranscriptionResult:
+        """The pre-recorded request, made with httpx directly.
+
+        The SDK's request wrapper applies its own single timeout per request and retries, which
+        defeats both the long read / short write split and cancellation. The endpoint is simple
+        enough to call ourselves; the SDK still parses nothing here, `to_result` reads the JSON.
+        """
+        key = self._key_provider()
+        if not key:
+            raise MissingKeyError("No Deepgram API key. Enter one in Settings.")
         options = dict(PRERECORDED_OPTIONS)
         if multichannel:
             options["multichannel"] = True
+        params = {k: ("true" if v is True else "false" if v is False else v) for k, v in options.items()}
+        self._cancel_requested = False
+
+        def body():
+            with audio.open("rb") as f:
+                while chunk := f.read(UPLOAD_CHUNK_BYTES):
+                    if self._cancel_requested:
+                        raise CancelledError("Cancelled.")
+                    yield chunk
+
         try:
-            response = self._client.listen.v1.media.transcribe_file(request=audio.read_bytes(), **options)
-        except ApiError as e:
-            if e.status_code in (401, 403):
-                raise RejectedKeyError("Deepgram rejected the API key.") from e
-            raise TranscriptionError(f"Deepgram returned an error ({e.status_code}).") from e
+            with httpx.Client(timeout=PRERECORDED_TIMEOUT) as client:
+                response = client.post(
+                    PRERECORDED_URL,
+                    params=params,
+                    headers={"Authorization": f"Token {key}", "Content-Type": "application/octet-stream"},
+                    content=body(),
+                )
+        except CancelledError:
+            raise
+        except httpx.TimeoutException as e:
+            if self._cancel_requested:
+                raise CancelledError("Cancelled.") from e  # a stalled write gave up; the cancel is what the user wanted
+            raise TranscriptionError(
+                "Deepgram did not finish in time. Large files can take several minutes; try again later."
+            ) from e
         except httpx.HTTPError as e:
-            raise TranscriptionError("Could not reach Deepgram. Check your connection.") from e
-        return to_result(response)
+            if self._cancel_requested:
+                raise CancelledError("Cancelled.") from e
+            raise TranscriptionError(f"Could not connect to Deepgram ({type(e).__name__}). Check your connection.") from e
+        if self._cancel_requested:
+            raise CancelledError("Cancelled.")
+        if response.status_code in (401, 403):
+            raise RejectedKeyError("Deepgram rejected the API key.")
+        if response.status_code >= 400:
+            detail = ""
+            try:
+                detail = response.json().get("err_msg") or ""
+            except ValueError:
+                pass
+            raise TranscriptionError(f"Deepgram returned an error ({response.status_code}{': ' + detail if detail else ''}).")
+        try:
+            payload = response.json()
+        except ValueError as e:
+            raise TranscriptionError("Deepgram returned an unreadable response.") from e
+        return to_result(payload)
 
 
 def to_result(response: Any) -> TranscriptionResult:

@@ -58,6 +58,15 @@ One contract test talks to the real Deepgram API and only runs when `DEEPGRAM_AP
 DEEPGRAM_API_KEY=... uv run pytest tests/test_deepgram_gateway.py
 ```
 
+## Transcribing files
+
+Open files or drop them onto the window; they are transcribed one at a time. In the queue,
+**Remove** takes a waiting or finished item out, **Cancel** abandons the upload in progress (the
+result, if any, is discarded), **Retry** re-queues a failed item, and **Clear finished** empties
+done, failed and cancelled items. A large file takes a while: the app waits up to ten minutes for
+Deepgram to process it, and says so if that runs out. If Deepgram rejects a format, the error
+names the reason; a video container Deepgram does not accept can be converted to MP4 or M4A first.
+
 ## Capturing
 
 Pick a Source, optionally type a title, and press **Start capture**. While capturing, Live

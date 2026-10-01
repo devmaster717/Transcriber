@@ -4,61 +4,79 @@ import pytest
 
 from transcriber.core.app import CaptureChanged
 from transcriber.core.capture import CaptureError, CaptureState, DeviceKind
-from transcriber.core.gateway import TranscriptionError
+from transcriber.core.gateway import Caption
 from transcriber.core.model import SourceKind, TranscriptStatus
 
 from .fakes import FIXTURES, wav_frames
 
 
-def test_stopping_a_microphone_capture_produces_a_transcript_from_the_recording(
-    core, gateway, audio, transcripts_dir
+def say(stream, *lines):
+    for i, (speaker, text) in enumerate(lines):
+        stream.deliver(Caption(text, True, float(i * 3), speaker=speaker, ends_utterance=True))
+
+
+def test_stopping_a_microphone_capture_turns_the_live_captions_into_the_transcript(
+    core, gateway, audio, transcripts_dir, clock
 ):
     core.start_capture(SourceKind.MICROPHONE, title="Standup")
     assert core.capture_status().state is CaptureState.CAPTURING
     assert [d.id for d in audio.opened] == ["fake-mic"]
+    assert b"".join(gateway.stream.sent) == wav_frames(FIXTURES / "hello.wav")
+    say(gateway.stream, (0, "Morning everyone, can you hear me?"), (1, "Yes, loud and clear."))
+    clock.advance(seconds=12)
 
     transcript = core.stop_capture()
 
     assert core.capture_status().state is CaptureState.COMPLETE
+    assert gateway.requests == []  # nothing is sent to Deepgram again (ADR-0004)
+    assert gateway.stream.closed is True
     assert transcript.source_kind is SourceKind.MICROPHONE
     assert transcript.title == "Standup"
-    assert transcript.source_path is None
-    assert [p.text for p in transcript.paragraphs] == [
-        "Morning everyone, can you hear me?",
-        "Yes, loud and clear.",
+    assert transcript.status is TranscriptStatus.COMPLETE
+    assert transcript.source_path is None and transcript.recording_path is None
+    assert transcript.duration == 12.0
+    assert [(p.speaker, p.start, p.end, p.text) for p in transcript.paragraphs] == [
+        (0, 0.0, 3.0, "Morning everyone, can you hear me?"),
+        (1, 3.0, 12.0, "Yes, loud and clear."),
     ]
     assert transcript.rendering_path == transcripts_dir / "2026-09-30 14-05 Standup.txt"
-    assert transcript.rendering_path.read_text(encoding="utf-8").startswith(
-        "Standup\n2026-09-30 14:05 · 12 s · Microphone\n"
+    assert transcript.rendering_path.read_text(encoding="utf-8") == (
+        "Standup\n"
+        "2026-09-30 14:05 · 12 s · Microphone\n"
+        "\n"
+        "[00:00:00] Speaker 1: Morning everyone, can you hear me?\n"
+        "[00:00:03] Speaker 2: Yes, loud and clear.\n"
     )
     assert [e.transcript.id for e in core.library()] == [transcript.id]
-    # The gateway received the whole Recording as a 16 kHz mono WAV.
-    assert gateway.request_bytes[0][:4] == b"RIFF"
-    assert gateway.request_bytes[0][44:] == wav_frames(FIXTURES / "hello.wav")
 
 
-def test_the_recording_exists_during_a_capture_and_is_gone_once_the_transcript_is_written(core):
+def test_text_still_provisional_at_stop_is_kept_rather_than_thrown_away(core, gateway):
     core.start_capture(SourceKind.MICROPHONE)
-    recording = core.capture_status().recording_path
-    assert recording is not None and recording.exists()
+    gateway.stream.deliver(Caption("Morning everyone,", True, 0.4, speaker=0))
+    gateway.stream.deliver(Caption("can you hear", False, 1.5, speaker=0))
 
     transcript = core.stop_capture()
 
-    assert not recording.exists()
-    assert transcript.recording_path is None
-    assert core.capture_status().transcript_id == transcript.id
+    assert [p.text for p in transcript.paragraphs] == ["Morning everyone, can you hear"]
 
 
-def test_the_recording_survives_a_failed_finalising_pass(core, gateway):
-    gateway.fail_with = TranscriptionError("Could not reach Deepgram. Check your connection.")
+def test_a_capture_with_no_speech_still_produces_an_empty_transcript(core, gateway):
+    core.start_capture(SourceKind.MICROPHONE, title="Silence")
+
+    transcript = core.stop_capture()
+
+    assert transcript.paragraphs == []
+    assert transcript.rendering_path.read_text(encoding="utf-8").startswith("Silence\n")
+
+
+def test_no_recording_is_written_during_a_capture(core, data_dir):
     core.start_capture(SourceKind.MICROPHONE)
-    recording = core.capture_status().recording_path
+    assert core.capture_status().recording_path is None
+    assert not (data_dir / "recordings").exists()
 
-    provisional = core.stop_capture()
+    core.stop_capture()
 
-    assert recording.exists()
-    assert provisional.status is TranscriptStatus.PROVISIONAL
-    assert core.capture_status().state is CaptureState.NEEDS_RETRY
+    assert not (data_dir / "recordings").exists()
 
 
 def test_the_source_kind_may_be_given_as_its_plain_string(core):
@@ -74,17 +92,14 @@ def test_a_system_audio_capture_listens_to_the_loopback_device_and_is_labelled_s
     core.start_capture(SourceKind.SYSTEM_AUDIO, title="Webinar")
     assert [d.id for d in audio.opened] == ["fake-loop"]
     assert gateway.stream.channels == 1
+    say(gateway.stream, (0, "Welcome to the webinar."))
 
     transcript = core.stop_capture()
 
     assert transcript.source_kind is SourceKind.SYSTEM_AUDIO
     assert transcript.rendering_path == transcripts_dir / "2026-09-30 14-05 Webinar.txt"
-    assert transcript.rendering_path.read_text(encoding="utf-8").startswith(
-        "Webinar\n2026-09-30 14:05 · 12 s · System Audio\n"
-    )
+    assert transcript.rendering_path.read_text(encoding="utf-8").startswith("Webinar\n2026-09-30 14:05 · 0 s · System Audio\n")
     assert gateway.stream.closed is True
-    assert core.capture_status().state is CaptureState.COMPLETE
-    assert transcript.recording_path is None
 
 
 def test_a_system_audio_capture_is_refused_when_there_is_nothing_to_capture_from(core, audio):
@@ -128,3 +143,11 @@ def test_capture_state_changes_are_announced_to_subscribers(core):
     states = [e.status.state for e in received if isinstance(e, CaptureChanged)]
     assert states == [CaptureState.CAPTURING, CaptureState.FINALISING, CaptureState.COMPLETE]
     assert all(e.status.title == "Standup" for e in received if isinstance(e, CaptureChanged))
+
+
+def test_a_completed_capture_cannot_be_retranscribed(core):
+    core.start_capture(SourceKind.MICROPHONE)
+    transcript = core.stop_capture()
+
+    with pytest.raises(ValueError, match="re-transcribed"):
+        core.retranscribe(transcript.id)

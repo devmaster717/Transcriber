@@ -61,14 +61,12 @@ DEEPGRAM_API_KEY=... uv run pytest tests/test_deepgram_gateway.py
 ## Capturing
 
 Pick a Source, optionally type a title, and press **Start capture**. While capturing, Live
-Captions stream into the right-hand panel; provisional text is grey and is replaced as Deepgram
-finalises it. If the live connection drops the app reconnects with backoff and says so, and the
-Recording keeps going regardless. Press **Stop** and the Recording is sent to Deepgram, the
-Transcript is written to `Documents/Transcriber/`, and the Recording is deleted (see ADR-0002 and
-ADR-0003: the captions are display-only, the Transcript comes from the Recording). If the Deepgram
-call fails the Recording is kept and the Live Captions are saved as a **provisional** Transcript;
-select it in the Library and press **Retry** to send the Recording again. The Recording is deleted
-only once a Retry succeeds.
+Captions stream into the right-hand panel, built into whole sentences as Deepgram returns them;
+provisional text is grey and is replaced as it is finalised. Press **Stop** and, within a second
+or two, the Live Captions become the Transcript, written to `Documents/Transcriber/`. Nothing is
+recorded and nothing is sent to Deepgram a second time (see ADR-0004). If the live connection
+drops the app reconnects with backoff and says so, but the words spoken during the gap are lost;
+a Capture cannot be re-transcribed afterwards.
 
 Sources: **Meeting Capture** (the default: Microphone and System Audio together, so one Transcript
 covers both sides of a call, with your own words attributed to the Speaker "You"), **Microphone**

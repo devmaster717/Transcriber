@@ -28,12 +28,8 @@ _Avoid_: session, recording session, stream
 A Capture that takes the Microphone and System Audio together, so the Transcript covers both sides of a call. The Microphone side is attributed to the Speaker "You".
 _Avoid_: call capture, dual capture
 
-**Recording**:
-The audio of a Capture, kept only until its Transcript has been produced and then discarded. A Recording is never the final product.
-_Avoid_: audio file (a File Source is a file on disk that the app never deletes; a Recording is the app's own temporary audio)
-
 **Live Captions**:
-The provisional text shown on screen while a Capture is running. Live Captions are not the Transcript; the Transcript is produced from the Recording after the Capture stops.
+The text shown on screen while a Capture is running, built line by line as Deepgram returns it. When the Capture stops, the Live Captions become its Transcript; nothing is sent to Deepgram again (ADR-0004).
 _Avoid_: live transcript, interim results, partials
 
 **Library**:

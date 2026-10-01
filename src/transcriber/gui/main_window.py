@@ -318,8 +318,8 @@ class MainWindow(QMainWindow):
     def _stop_capture(self) -> None:
         self._elapsed_timer.stop()
         self.capture_button.setEnabled(False)
-        self.capture_indicator.setText("Finalising…")
-        self.status.setText("Sending the Recording to Deepgram…")
+        self.capture_indicator.setText("Finishing…")
+        self.status.setText("Collecting the last captions…")
         worker = CoreWorker(self._core.stop_capture, parent=self)
         worker.ready.connect(self._on_capture_ready)
         worker.failed.connect(self._on_capture_failed)
@@ -400,18 +400,12 @@ class MainWindow(QMainWindow):
         self._reset_capture_controls()
         self.title_edit.clear()
         self.refresh_library(select_id=transcript.id)
-        if transcript.status is TranscriptStatus.PROVISIONAL:
-            self.status.setText(
-                "Deepgram could not transcribe the Recording, so it was kept. "
-                "The Live Captions are shown as a provisional Transcript; press Retry when you are back online."
-            )
-        else:
-            self.status.setText(f"Saved to {transcript.rendering_path}")
+        self.status.setText(f"Saved to {transcript.rendering_path}")
 
     @Slot(str)
     def _on_capture_failed(self, message: str) -> None:
         self._reset_capture_controls()
-        self.status.setText(f"{message} The Recording was kept.")
+        self.status.setText(message)
 
     def _reset_capture_controls(self) -> None:
         self.capture_button.setText("Start capture")
@@ -562,10 +556,8 @@ class MainWindow(QMainWindow):
 
     def _show_entry(self, entry: LibraryEntry | None) -> None:
         has_entry = entry is not None
-        provisional = has_entry and entry.transcript.status is TranscriptStatus.PROVISIONAL
         self.open_folder_button.setEnabled(has_entry and entry.transcript.rendering_path is not None)
         self.open_file_button.setEnabled(has_entry and entry.rendering_found and entry.transcript.rendering_path is not None)
-        self.retranscribe_button.setText("Retry" if provisional else "Re-transcribe")
         self.retranscribe_button.setEnabled(has_entry and entry.can_retranscribe)
         self.remove_button.setEnabled(has_entry)
         for b in (self.copy_button, self.rename_button, self.rename_speaker_button):
@@ -579,14 +571,8 @@ class MainWindow(QMainWindow):
             missing.append("Rendering file not found")
         if not entry.source_found:
             missing.append("source file not found")
-        if not entry.recording_found:
-            missing.append("Recording not found, so it cannot be retried")
         if missing:
             self.status.setText(", ".join(missing).capitalize() + ". The Transcript is still kept by the app.")
-        elif provisional:
-            self.status.setText(
-                "Provisional: this is what the Live Captions heard. Press Retry to send the kept Recording to Deepgram."
-            )
         else:
             self.status.setText(f"{entry.transcript.rendering_path}")
 
@@ -648,8 +634,7 @@ class MainWindow(QMainWindow):
         entry = self.selected_entry()
         if entry is None:
             return
-        verb = "Retrying" if entry.transcript.status is TranscriptStatus.PROVISIONAL else "Re-transcribing"
-        self._run(f"{verb} {entry.transcript.title}…", lambda: self._core.retranscribe(entry.transcript.id))
+        self._run(f"Re-transcribing {entry.transcript.title}…", lambda: self._core.retranscribe(entry.transcript.id))
 
     @Slot()
     def _remove(self) -> None:
@@ -698,10 +683,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _on_ready(self, transcript: Transcript) -> None:
         self.refresh_library(select_id=transcript.id)
-        if transcript.status is TranscriptStatus.PROVISIONAL:
-            self.status.setText("Still could not reach Deepgram. The Recording is kept; try again later.")
-        else:
-            self.status.setText(f"Saved to {transcript.rendering_path}")
+        self.status.setText(f"Saved to {transcript.rendering_path}")
 
     @Slot(str)
     def _on_failed(self, message: str) -> None:

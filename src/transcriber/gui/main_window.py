@@ -13,9 +13,12 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -35,7 +38,7 @@ from ..core.capture import CaptureError, CaptureState, LiveCaptions
 from ..core.gateway import TranscriptionError
 from ..core.model import SourceKind, Transcript, TranscriptStatus
 from ..core.queue import QueueItem, QueueState
-from ..core.rendering import format_duration, format_timestamp, render
+from ..core.rendering import RenderingOptions, format_duration, format_timestamp, render
 
 AUDIO_FILTER = (
     "Audio and video (*.mp3 *.wav *.m4a *.mp4 *.flac *.ogg *.webm *.aac *.wma *.opus *.mkv *.mov);;"
@@ -165,15 +168,45 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.library_list, stretch=1)
         left_layout.addLayout(actions)
 
-        # Viewer, and the Live Captions panel that replaces it during a Capture
+        # Viewer with its Rendering toggles, and the Live Captions panel that replaces it during a Capture
         self.viewer = QPlainTextEdit()
         self.viewer.setReadOnly(True)
         self.viewer.setPlaceholderText("Select a Transcript to read its Rendering.")
+        defaults = self._core.settings()
+        self.timestamps_toggle = QCheckBox("Timestamps")
+        self.timestamps_toggle.setChecked(defaults.include_timestamps)
+        self.speakers_toggle = QCheckBox("Speaker labels")
+        self.speakers_toggle.setChecked(defaults.include_speaker_labels)
+        for toggle in (self.timestamps_toggle, self.speakers_toggle):
+            toggle.toggled.connect(self._rerender)
+        self.make_default_button = QPushButton("Make default")
+        self.make_default_button.setToolTip("Write new Rendering files with the current toggles")
+        self.make_default_button.clicked.connect(self._make_default)
+        self.copy_button = QPushButton("Copy")
+        self.copy_button.clicked.connect(self._copy)
+        self.rename_button = QPushButton("Rename…")
+        self.rename_button.clicked.connect(self._rename_transcript)
+        self.rename_speaker_button = QPushButton("Rename speaker…")
+        self.rename_speaker_button.clicked.connect(self._rename_speaker)
+        viewer_bar = QHBoxLayout()
+        viewer_bar.addWidget(self.timestamps_toggle)
+        viewer_bar.addWidget(self.speakers_toggle)
+        viewer_bar.addWidget(self.make_default_button)
+        viewer_bar.addStretch(1)
+        viewer_bar.addWidget(self.copy_button)
+        viewer_bar.addWidget(self.rename_button)
+        viewer_bar.addWidget(self.rename_speaker_button)
+        viewer_panel = QWidget()
+        viewer_layout = QVBoxLayout(viewer_panel)
+        viewer_layout.setContentsMargins(0, 0, 0, 0)
+        viewer_layout.addLayout(viewer_bar)
+        viewer_layout.addWidget(self.viewer, stretch=1)
+        self.viewer_panel = viewer_panel
         self.captions_view = QTextEdit()
         self.captions_view.setReadOnly(True)
         self.captions_view.setPlaceholderText("Live Captions appear here as Deepgram returns them.")
         self.right_stack = QStackedWidget()
-        self.right_stack.addWidget(self.viewer)
+        self.right_stack.addWidget(self.viewer_panel)
         self.right_stack.addWidget(self.captions_view)
 
         self._bridge = EventBridge(self)
@@ -299,7 +332,7 @@ class MainWindow(QMainWindow):
         self.title_edit.setEnabled(True)
         self.capture_indicator.setText("")
         self.capture_indicator.setStyleSheet("")
-        self.right_stack.setCurrentWidget(self.viewer)
+        self.right_stack.setCurrentWidget(self.viewer_panel)
 
     # ---- Drag and drop -------------------------------------------------------------------
 
@@ -447,10 +480,12 @@ class MainWindow(QMainWindow):
         self.retranscribe_button.setText("Retry" if provisional else "Re-transcribe")
         self.retranscribe_button.setEnabled(has_entry and entry.can_retranscribe)
         self.remove_button.setEnabled(has_entry)
+        for b in (self.copy_button, self.rename_button, self.rename_speaker_button):
+            b.setEnabled(has_entry)
         if entry is None:
             self.viewer.clear()
             return
-        self.viewer.setPlainText(render(entry.transcript))
+        self.viewer.setPlainText(render(entry.transcript, self._viewer_options()))
         missing = []
         if not entry.rendering_found:
             missing.append("Rendering file not found")
@@ -466,6 +501,57 @@ class MainWindow(QMainWindow):
             )
         else:
             self.status.setText(f"{entry.transcript.rendering_path}")
+
+    # ---- Rendering toggles, Copy, renaming -----------------------------------------------
+
+    def _viewer_options(self) -> RenderingOptions:
+        return RenderingOptions(self.timestamps_toggle.isChecked(), self.speakers_toggle.isChecked())
+
+    @Slot()
+    def _rerender(self) -> None:
+        """The toggles change only what is shown; the Rendering file and the defaults are untouched."""
+        entry = self.selected_entry()
+        if entry is not None:
+            self.viewer.setPlainText(render(entry.transcript, self._viewer_options()))
+
+    @Slot()
+    def _make_default(self) -> None:
+        options = self._viewer_options()
+        self._core.update_settings(
+            include_timestamps=options.include_timestamps, include_speaker_labels=options.include_speaker_labels
+        )
+        self.status.setText("New Rendering files will use these toggles. Existing files are unchanged.")
+
+    @Slot()
+    def _copy(self) -> None:
+        QApplication.clipboard().setText(self.viewer.toPlainText())
+        self.status.setText("Copied the Rendering to the clipboard.")
+
+    @Slot()
+    def _rename_transcript(self) -> None:
+        entry = self.selected_entry()
+        if entry is None:
+            return
+        title, ok = QInputDialog.getText(self, "Rename Transcript", "Title:", text=entry.transcript.title)
+        if ok and title.strip():
+            renamed = self._core.rename_transcript(entry.transcript.id, title)
+            self.refresh_library(select_id=renamed.id)
+
+    @Slot()
+    def _rename_speaker(self) -> None:
+        entry = self.selected_entry()
+        if entry is None or not entry.transcript.speaker_names:
+            return
+        names = entry.transcript.speaker_names
+        choices = [names[s] for s in sorted(names)]
+        current, ok = QInputDialog.getItem(self, "Rename speaker", "Which speaker?", choices, 0, editable=False)
+        if not ok:
+            return
+        speaker = sorted(names)[choices.index(current)]
+        name, ok = QInputDialog.getText(self, "Rename speaker", f"New name for {current}:", text=current)
+        if ok and name.strip():
+            renamed = self._core.rename_speaker(entry.transcript.id, speaker, name)
+            self.refresh_library(select_id=renamed.id)
 
     # ---- Library actions -----------------------------------------------------------------
 

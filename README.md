@@ -59,6 +59,9 @@ Capture records two channels and asks Deepgram for a per-channel transcript. Sys
 the whole output device, so anything else playing through it is transcribed too. Device selection
 is a later ticket.
 
+**Always on top** keeps the window, and so the Live Captions, above the call you are in. The window
+remembers its size, position, always-on-top state and the last selected Transcript between runs.
+
 ## Reading, copying and renaming
 
 Above the viewer, **Timestamps** and **Speaker labels** change what is shown without touching the

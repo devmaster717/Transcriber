@@ -46,13 +46,20 @@ class TranscriptionResult:
 
 @dataclass(frozen=True)
 class Caption:
-    """One piece of Live Captions text. Provisional captions are replaced; final ones accumulate."""
+    """One piece of Live Captions text as the service sends it.
+
+    The service cuts final text into segments by time, not by sentence; `ends_utterance` is its
+    signal that the speaker paused, which is where a line of Live Captions should end.
+    """
 
     text: str
     is_final: bool
     start: float
     speaker: int | None = None
     channel: int = 0
+    ends_utterance: bool = False  # the service noticed a pause after this text (speech_final)
+    silence: bool = False  # the speaker has gone quiet for a while (UtteranceEnd); carries no text
+    closed: bool = False  # set by Live Captions: nothing more is appended to this line
 
 
 class LiveStream(Protocol):

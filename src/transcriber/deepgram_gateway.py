@@ -47,6 +47,11 @@ LIVE_OPTIONS: dict[str, Any] = {
     "diarize": True,
     "punctuate": True,
     "interim_results": True,
+    # Deepgram's default pause of 10 ms ends an utterance at the slightest breath, which made Live
+    # Captions break mid-sentence. 300 ms is a natural pause; UtteranceEnd after 1 s of silence is
+    # the fallback that closes a line when no speech_final result arrives.
+    "endpointing": 300,
+    "utterance_end_ms": 1000,
 }
 
 
@@ -77,7 +82,13 @@ class _DeepgramStream:
                 pass
 
     def _on_message(self, message: Any) -> None:
-        if getattr(message, "type", None) != "Results":
+        kind = getattr(message, "type", None)
+        if kind == "UtteranceEnd":
+            # The speaker went quiet without a speech_final result: close the open line.
+            channel = int(message.channel[0]) if getattr(message, "channel", None) else 0
+            self._on_caption(Caption(text="", is_final=True, start=float(message.last_word_end), channel=channel, silence=True))
+            return
+        if kind != "Results":
             return
         alternatives = message.channel.alternatives
         if not alternatives or not alternatives[0].transcript:
@@ -91,6 +102,7 @@ class _DeepgramStream:
                 start=float(message.start),
                 speaker=words[0].speaker if words else None,
                 channel=int(message.channel_index[0]) if message.channel_index else 0,
+                ends_utterance=bool(getattr(message, "speech_final", False)),
             )
         )
 

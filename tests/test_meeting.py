@@ -27,7 +27,7 @@ def meeting_result() -> TranscriptionResult:
 def make_core(gateway, data_dir, transcripts_dir, clock):
     audio = FakeAudioCapture(auto_play=False)
     core = TranscriberCore(
-        gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir, clock=clock
+        gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir, clock=clock, env={"DEEPGRAM_API_KEY": "test-key"}
     )
     return core, audio
 

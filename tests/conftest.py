@@ -64,6 +64,7 @@ def core(
         data_dir=data_dir,
         transcripts_dir=transcripts_dir,
         clock=clock,
+        env={"DEEPGRAM_API_KEY": "test-key"},
     )
 
 

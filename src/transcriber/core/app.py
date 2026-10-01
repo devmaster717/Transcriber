@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import functools
+import os
 import re
 import threading
 import time
 import uuid
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -25,10 +26,13 @@ from .capture import (
     Recorder,
     SAMPLE_RATE,
 )
+from .credentials import CredentialStore, NoCredentialStore
 from .gateway import (
     MAX_FILE_BYTES,
     Caption,
+    KeyProblem,
     LiveStream,
+    MissingKeyError,
     TranscriptionError,
     TranscriptionGateway,
     TranscriptionResult,
@@ -71,7 +75,15 @@ class CaptionsChanged:
     live: LiveCaptions
 
 
-Event = TranscriptReady | QueueChanged | CaptureChanged | CaptionsChanged
+@dataclass(frozen=True)
+class ApiKeyProblem:
+    """Deepgram rejected the key, or there is none. The settings screen is the fix."""
+
+    message: str
+
+
+Event = TranscriptReady | QueueChanged | CaptureChanged | CaptionsChanged | ApiKeyProblem
+API_KEY_ENV = "DEEPGRAM_API_KEY"
 EventHandler = Callable[[Event], None]
 
 RECONNECT_BACKOFF = (0.5, 1.0, 2.0, 4.0, 8.0, 10.0)
@@ -172,9 +184,13 @@ class TranscriberCore:
         clock: Clock = datetime.now,
         max_file_bytes: int = MAX_FILE_BYTES,
         sleeper: Callable[[float], None] = time.sleep,
+        credentials: CredentialStore | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         self._gateway = gateway
         self._audio = audio_capture
+        self._credentials = credentials if credentials is not None else NoCredentialStore()
+        self._env = env if env is not None else os.environ
         self._store = TranscriptStore(data_dir)
         self._settings = SettingsStore(data_dir)
         self._recordings_dir = data_dir / "recordings"
@@ -250,6 +266,7 @@ class TranscriberCore:
             transcript = self.transcribe_file(item.path)
         except TranscriptionError as e:
             item = self._queue.update(item.id, state=QueueState.FAILED, error=e.message)
+            self._note_key_problem(e)
         except OSError as e:
             item = self._queue.update(item.id, state=QueueState.FAILED, error=f"Could not read the file: {e.strerror or e}")
         else:
@@ -281,6 +298,7 @@ class TranscriberCore:
             raise CaptureError("Audio capture is not available on this platform.")
         if kind not in CAPTURE_DEVICE_KINDS:
             raise CaptureError(f"{kind.label} capture is not available yet.")
+        self._require_api_key()
         with self._capture_lock:
             if self._capture_status.state in (CaptureState.CAPTURING, CaptureState.FINALISING):
                 raise CaptureError("A Capture is already running.")
@@ -320,7 +338,14 @@ class TranscriberCore:
         return status
 
     def _require_device(self, device_kind: DeviceKind) -> AudioDevice:
-        device = self._audio.default_device(device_kind)
+        """The device chosen in settings if it is still present, else the Windows default."""
+        settings = self.settings()
+        chosen = settings.microphone_device_id if device_kind is DeviceKind.INPUT else settings.output_device_id
+        device = None
+        if chosen:
+            device = next((d for d in self._audio.list_devices() if d.id == chosen and d.kind is device_kind), None)
+        if device is None:
+            device = self._audio.default_device(device_kind)
         if device is None:
             raise CaptureError(
                 "No microphone was found."
@@ -404,7 +429,8 @@ class TranscriberCore:
         self._emit(CaptureChanged(status))
         try:
             result = self._gateway.transcribe(active.recorder.path, multichannel=active.channels > 1)
-        except TranscriptionError:
+        except TranscriptionError as e:
+            self._note_key_problem(e)
             provisional = self._save_provisional(active)
             with self._capture_lock:
                 self._capture = None
@@ -479,7 +505,8 @@ class TranscriberCore:
         self._emit(CaptureChanged(self._capture_status))
         try:
             result = self._gateway.transcribe(recording, multichannel=_wav_channels(recording) > 1)
-        except TranscriptionError:
+        except TranscriptionError as e:
+            self._note_key_problem(e)
             with self._capture_lock:
                 self._capture_status = CaptureStatus(
                     CaptureState.NEEDS_RETRY, provisional.title, provisional.created, recording, provisional.id,
@@ -504,6 +531,34 @@ class TranscriberCore:
         """Where Capture Renderings go: the settings value if set, else the configured default."""
         configured = self.settings().transcripts_dir
         return Path(configured) if configured else self._transcripts_dir
+
+    # ---- API key -------------------------------------------------------------------------
+
+    def api_key(self) -> str | None:
+        """The key Deepgram calls use: the credential store first, then the environment variable."""
+        stored = self._credentials.get_api_key()
+        if stored:
+            return stored
+        return self._env.get(API_KEY_ENV, "").strip() or None
+
+    def has_stored_api_key(self) -> bool:
+        return bool(self._credentials.get_api_key())
+
+    def set_api_key(self, key: str) -> None:
+        """Store the key in the credential store only. It never lands in a file the app writes."""
+        clean = key.strip()
+        if not clean:
+            self._credentials.clear_api_key()
+        else:
+            self._credentials.set_api_key(clean)
+
+    def _require_api_key(self) -> None:
+        if self.api_key() is None:
+            raise MissingKeyError("No Deepgram API key. Enter one in Settings.")
+
+    def _note_key_problem(self, error: TranscriptionError) -> None:
+        if isinstance(error, KeyProblem):
+            self._emit(ApiKeyProblem(error.message))
 
     # ---- Settings ------------------------------------------------------------------------
 
@@ -577,6 +632,7 @@ class TranscriberCore:
     def _transcribe_source(self, transcript_id: str, path: Path) -> Transcript:
         if path.stat().st_size > self._max_file_bytes:
             raise TranscriptionError("File is larger than Deepgram's 2 GB limit.")
+        self._require_api_key()
         result = self._gateway.transcribe(path)
         return self._finish(
             transcript_id=transcript_id,

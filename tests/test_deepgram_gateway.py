@@ -41,7 +41,7 @@ def test_multichannel_paragraphs_carry_their_channel():
 
 @pytest.mark.skipif(not os.environ.get("DEEPGRAM_API_KEY"), reason="DEEPGRAM_API_KEY not set")
 def test_real_deepgram_transcribes_the_spoken_fixture():
-    gateway = DeepgramGateway(api_key=os.environ["DEEPGRAM_API_KEY"])
+    gateway = DeepgramGateway(os.environ["DEEPGRAM_API_KEY"])
 
     result = gateway.transcribe(FIXTURES / "hello.wav")
 

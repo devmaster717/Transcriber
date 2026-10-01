@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -11,18 +10,11 @@ from PySide6.QtWidgets import QApplication
 
 from ..core.app import TranscriberCore
 from ..core.capture import AudioCapture
-from ..core.gateway import RejectedKeyError, TranscriptionResult
+from ..core.credentials import CredentialStore, KeyringCredentialStore, NoCredentialStore
 from ..deepgram_gateway import DeepgramGateway
 from .main_window import MainWindow
 
 APP_NAME = "Transcriber"
-
-
-class MissingKeyGateway:
-    """Stands in for Deepgram when no key is configured, so the window can say so inline."""
-
-    def transcribe(self, audio: Path) -> TranscriptionResult:
-        raise RejectedKeyError("No Deepgram API key. Set DEEPGRAM_API_KEY and restart.")
 
 
 def build_audio_capture() -> AudioCapture | None:
@@ -33,14 +25,27 @@ def build_audio_capture() -> AudioCapture | None:
     return WasapiCapture()
 
 
+def build_credentials() -> CredentialStore:
+    try:
+        import keyring
+
+        keyring.get_keyring()
+        return KeyringCredentialStore()
+    except Exception:  # noqa: BLE001 - no usable backend: the env var still works
+        return NoCredentialStore()
+
+
 def build_core() -> TranscriberCore:
-    key = os.environ.get("DEEPGRAM_API_KEY", "").strip()
-    gateway = DeepgramGateway(key) if key else MissingKeyGateway()
-    return TranscriberCore(
+    holder: dict[str, TranscriberCore] = {}
+    gateway = DeepgramGateway(key_provider=lambda: holder["core"].api_key())
+    core = TranscriberCore(
         gateway=gateway,
         audio_capture=build_audio_capture(),
         data_dir=Path(user_data_dir(APP_NAME, appauthor=False)),
+        credentials=build_credentials(),
     )
+    holder["core"] = core
+    return core
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -48,4 +53,6 @@ def run(argv: list[str] | None = None) -> int:
     app.setApplicationName(APP_NAME)
     window = MainWindow(build_core())
     window.show()
+    if window._core.api_key() is None:
+        window.open_settings("Welcome. Enter your Deepgram API key to get started.")
     return app.exec()

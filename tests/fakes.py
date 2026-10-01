@@ -144,9 +144,26 @@ class FakeAudioCapture:
         self._sinks[device_id](chunk)
 
 
+class FakeCredentialStore:
+    """An in-memory credential store standing in for the OS credential manager."""
+
+    def __init__(self, key: str | None = None) -> None:
+        self.key = key
+
+    def get_api_key(self) -> str | None:
+        return self.key
+
+    def set_api_key(self, key: str) -> None:
+        self.key = key
+
+    def clear_api_key(self) -> None:
+        self.key = None
+
+
 __all__ = [
     "FIXTURES",
     "FakeAudioCapture",
+    "FakeCredentialStore",
     "FakeLiveStream",
     "FakeTranscriptionGateway",
     "TranscriptionError",

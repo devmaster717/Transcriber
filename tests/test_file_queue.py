@@ -67,7 +67,7 @@ def test_retrying_a_failed_file_puts_it_back_in_line(core, gateway, make_audio_f
 
 
 def test_a_file_over_the_size_limit_is_rejected_without_a_request(gateway, data_dir, clock, make_audio_file):
-    core = TranscriberCore(gateway=gateway, data_dir=data_dir, clock=clock, max_file_bytes=100)
+    core = TranscriberCore(gateway=gateway, data_dir=data_dir, clock=clock, max_file_bytes=100, env={"DEEPGRAM_API_KEY": "test-key"})
     huge = make_audio_file("huge.wav")
     huge.write_bytes(b"\0" * 101)
     core.enqueue([huge])

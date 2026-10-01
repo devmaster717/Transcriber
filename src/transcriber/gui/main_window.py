@@ -33,12 +33,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.app import CaptionsChanged, LibraryEntry, TranscriberCore
+from ..core.app import ApiKeyProblem, CaptionsChanged, LibraryEntry, TranscriberCore
 from ..core.capture import CaptureError, CaptureState, LiveCaptions
-from ..core.gateway import TranscriptionError
+from ..core.gateway import KeyProblem, TranscriptionError
 from ..core.model import SourceKind, Transcript, TranscriptStatus
 from ..core.queue import QueueItem, QueueState
 from ..core.rendering import RenderingOptions, format_duration, format_timestamp, render
+from .settings_dialog import SettingsDialog
 
 AUDIO_FILTER = (
     "Audio and video (*.mp3 *.wav *.m4a *.mp4 *.flac *.ogg *.webm *.aac *.wma *.opus *.mkv *.mov);;"
@@ -58,6 +59,7 @@ class CoreWorker(QThread):
 
     ready = Signal(object)  # Transcript
     failed = Signal(str)
+    key_problem = Signal(str)
 
     def __init__(self, operation: Callable[[], Transcript], parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -66,6 +68,9 @@ class CoreWorker(QThread):
     def run(self) -> None:
         try:
             self.ready.emit(self._operation())
+        except KeyProblem as e:
+            self.failed.emit(e.message)
+            self.key_problem.emit(e.message)
         except TranscriptionError as e:
             self.failed.emit(e.message)
         except OSError as e:
@@ -106,10 +111,14 @@ class MainWindow(QMainWindow):
         # Top bar
         self.open_button = QPushButton("Open files…")
         self.open_button.clicked.connect(self._choose_files)
+        self.settings_button = QPushButton("Settings…")
+        self.settings_button.clicked.connect(lambda: self.open_settings())
         self.status = QLabel("Open audio files, or drop them onto this window.")
         self.status.setWordWrap(True)
+        self._settings_dialog: SettingsDialog | None = None
         top = QHBoxLayout()
         top.addWidget(self.open_button)
+        top.addWidget(self.settings_button)
         top.addWidget(self.status, stretch=1)
 
         # Capture controls
@@ -243,6 +252,10 @@ class MainWindow(QMainWindow):
         kind = SourceKind(self.source_kind.currentData())  # Qt hands a StrEnum back as a plain str
         try:
             status = self._core.start_capture(kind, self.title_edit.text())
+        except KeyProblem as e:
+            self.status.setText(e.message)
+            self.open_settings(e.message)
+            return
         except CaptureError as e:
             self.status.setText(e.message)
             return
@@ -263,6 +276,7 @@ class MainWindow(QMainWindow):
         worker = CoreWorker(self._core.stop_capture, parent=self)
         worker.ready.connect(self._on_capture_ready)
         worker.failed.connect(self._on_capture_failed)
+        worker.key_problem.connect(self.open_settings)
         self._capture_worker = worker
         worker.start()
 
@@ -284,6 +298,31 @@ class MainWindow(QMainWindow):
             self._show_captions(event.live)
             if self._core.capture_status().state is CaptureState.CAPTURING:
                 self._tick()
+        elif isinstance(event, ApiKeyProblem):
+            self.open_settings(event.message)
+
+    # ---- Settings ------------------------------------------------------------------------
+
+    def open_settings(self, message: str | None = None) -> SettingsDialog:
+        """Show the settings dialog, with a message when a key problem brought the user here."""
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            if message:
+                self._settings_dialog.message.setText(message)
+                self._settings_dialog.message.setVisible(True)
+            self._settings_dialog.raise_()
+            return self._settings_dialog
+        dialog = SettingsDialog(self._core, self, message=message)
+        dialog.accepted.connect(self._on_settings_saved)
+        self._settings_dialog = dialog
+        dialog.open()
+        return dialog
+
+    @Slot()
+    def _on_settings_saved(self) -> None:
+        settings = self._core.settings()
+        self.timestamps_toggle.setChecked(settings.include_timestamps)
+        self.speakers_toggle.setChecked(settings.include_speaker_labels)
+        self.status.setText("Settings saved." + ("" if self._core.api_key() else " No API key is configured yet."))
 
     def _show_captions(self, live: LiveCaptions) -> None:
         meeting = self._core.capture_status().kind is SourceKind.MEETING
@@ -604,6 +643,7 @@ class MainWindow(QMainWindow):
         self._worker = CoreWorker(operation, parent=self)
         self._worker.ready.connect(self._on_ready)
         self._worker.failed.connect(self._on_failed)
+        self._worker.key_problem.connect(self.open_settings)
         self._worker.start()
 
     @Slot(object)

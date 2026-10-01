@@ -16,11 +16,15 @@ uv sync
 ```
 
 ```bash
-DEEPGRAM_API_KEY=... uv run transcriber
+uv run transcriber
 ```
 
-The key comes from the `DEEPGRAM_API_KEY` environment variable for now; a settings screen that
-stores it in Windows Credential Manager is a later ticket.
+On first run the app asks for your Deepgram API key and stores it in Windows Credential Manager.
+It never lands in a file the app writes. If no key is stored, the `DEEPGRAM_API_KEY` environment
+variable is used instead, which is handy for development. **Settings…** also lets you pick which
+microphone and which output device to capture (Windows defaults preselected), where Capture
+transcripts go, and the Rendering defaults. If Deepgram rejects the key, the settings screen opens
+with the reason.
 
 ## Tests
 

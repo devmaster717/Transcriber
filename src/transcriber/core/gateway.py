@@ -62,8 +62,11 @@ OnStreamError = Callable[[str], None]
 
 
 class TranscriptionGateway(Protocol):
-    def transcribe(self, audio: Path) -> TranscriptionResult:
-        """Transcribe a whole audio file in one request (the pre-recorded operation)."""
+    def transcribe(self, audio: Path, multichannel: bool = False) -> TranscriptionResult:
+        """Transcribe a whole audio file in one request (the pre-recorded operation).
+
+        With `multichannel`, each channel is transcribed separately and paragraphs carry their channel.
+        """
         ...
 
     def open_stream(self, on_caption: OnCaption, on_error: OnStreamError, channels: int = 1) -> LiveStream:

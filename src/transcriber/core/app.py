@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import functools
 import re
 import threading
 import time
 import uuid
+import wave
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from .gateway import (
     TranscriptionGateway,
     TranscriptionResult,
 )
+from .mixer import ChannelMixer
 from .model import Paragraph, SourceKind, Transcript, TranscriptStatus, default_speaker_name
 from .queue import FileQueue, QueueItem, QueueState
 from .rendering import render
@@ -72,11 +75,41 @@ EventHandler = Callable[[Event], None]
 
 RECONNECT_BACKOFF = (0.5, 1.0, 2.0, 4.0, 8.0, 10.0)
 
-# Which device each single-Source Capture kind listens to. Meeting Capture (both at once) is #9.
-CAPTURE_DEVICE_KINDS = {
-    SourceKind.MICROPHONE: DeviceKind.INPUT,
-    SourceKind.SYSTEM_AUDIO: DeviceKind.LOOPBACK,
+# Which devices each Capture kind listens to, in channel order. A Meeting Capture is two channels:
+# 0 is the Microphone (the Speaker "You"), 1 is System Audio (everyone else).
+CAPTURE_DEVICE_KINDS: dict[SourceKind, tuple[DeviceKind, ...]] = {
+    SourceKind.MICROPHONE: (DeviceKind.INPUT,),
+    SourceKind.SYSTEM_AUDIO: (DeviceKind.LOOPBACK,),
+    SourceKind.MEETING: (DeviceKind.INPUT, DeviceKind.LOOPBACK),
 }
+
+YOU = "You"
+
+
+def attribute_speakers(kind: SourceKind, paragraphs: list[Paragraph]) -> tuple[list[Paragraph], dict[int, str]]:
+    """Give every paragraph a Speaker id that is unique across channels, with default names.
+
+    Deepgram numbers speakers per channel. For a Meeting Capture the Microphone channel is one
+    Speaker, "You" (id 0), and System Audio speakers are numbered from 1. Paragraphs come back in
+    time order across channels.
+    """
+    if kind is not SourceKind.MEETING:
+        ordered = sorted(paragraphs, key=lambda p: p.start)
+        return ordered, {s: default_speaker_name(s) for s in sorted({p.speaker for p in ordered})}
+    attributed = []
+    for p in sorted(paragraphs, key=lambda p: p.start):
+        speaker = 0 if p.channel == 0 else p.speaker + 1
+        attributed.append(replace(p, speaker=speaker))
+    names = {0: YOU} if any(p.speaker == 0 for p in attributed) else {}
+    for p in attributed:
+        if p.speaker > 0:
+            names[p.speaker] = f"Speaker {p.speaker}"
+    return attributed, names
+
+
+def _wav_channels(path: Path) -> int:
+    with wave.open(str(path), "rb") as w:
+        return w.getnchannels()
 
 
 @dataclass(frozen=True)
@@ -116,11 +149,12 @@ class _ActiveCapture:
     kind: SourceKind
     title: str
     started_at: datetime
-    device: AudioDevice
+    devices: list[AudioDevice]
     recorder: Recorder
-    handle: CaptureHandle | None = None
-    stream: LiveStream | None = None
     channels: int = 1
+    handles: list[CaptureHandle] = field(default_factory=list)
+    mixer: ChannelMixer | None = None
+    stream: LiveStream | None = None
 
 
 def default_transcripts_dir() -> Path:
@@ -235,8 +269,11 @@ class TranscriberCore:
     def capture_status(self) -> CaptureStatus:
         return self._capture_status
 
-    def start_capture(self, kind: SourceKind = SourceKind.MICROPHONE, title: str | None = None) -> CaptureStatus:
-        """Begin a Capture from the default device for `kind`. Only one Capture runs at a time."""
+    def start_capture(self, kind: SourceKind = SourceKind.MEETING, title: str | None = None) -> CaptureStatus:
+        """Begin a Capture. A Meeting Capture takes the Microphone and System Audio together as two channels.
+
+        Only one Capture runs at a time.
+        """
         kind = SourceKind(kind)
         if self._audio is None:
             raise CaptureError("Audio capture is not available on this platform.")
@@ -247,23 +284,19 @@ class TranscriberCore:
                 raise CaptureError("A Capture is already running.")
             # A Capture in needs_retry lives on as a provisional Transcript and is retried from the Library,
             # so it does not block a new one.
-            device_kind = CAPTURE_DEVICE_KINDS[kind]
-            device = self._audio.default_device(device_kind)
-            if device is None:
-                raise CaptureError(
-                    "No microphone was found."
-                    if device_kind is DeviceKind.INPUT
-                    else "No output device was found to capture System Audio from."
-                )
+            devices = [self._require_device(k) for k in CAPTURE_DEVICE_KINDS[kind]]
             started = self._clock()
             capture_id = uuid.uuid4().hex
             clean_title = (title or "").strip() or started.strftime("%Y-%m-%d %H:%M")
-            recorder = Recorder(self._recordings_dir / f"{capture_id}.wav")
-            active = _ActiveCapture(capture_id, kind, clean_title, started, device, recorder)
+            recorder = Recorder(self._recordings_dir / f"{capture_id}.wav", channels=len(devices))
+            active = _ActiveCapture(
+                id=capture_id, kind=kind, title=clean_title, started_at=started,
+                devices=devices, recorder=recorder, channels=len(devices),
+            )
             self._capture = active
             with self._live_lock:
                 self._live = LiveCaptions()
-            status = CaptureStatus(CaptureState.CAPTURING, clean_title, started, recorder.path)
+            status = CaptureStatus(CaptureState.CAPTURING, clean_title, started, recorder.path, kind=kind)
             self._capture_status = status
         self._emit(CaptureChanged(status))
         # Live Captions are best effort: a stream that cannot open now is retried in the background,
@@ -272,8 +305,27 @@ class TranscriberCore:
             active.stream = self._gateway.open_stream(self._on_caption, self._on_stream_error, active.channels)
         except TranscriptionError as e:
             threading.Thread(target=self._on_stream_error, args=(e.message,), daemon=True).start()
-        active.handle = self._audio.open(device, self._make_chunk_sink(active))
+        sink = self._make_chunk_sink(active)
+        if len(devices) == 1:
+            active.handles = [self._audio.open(devices[0], sink)]
+        else:
+            # Channel order is the order of CAPTURE_DEVICE_KINDS[kind]: Microphone first, then System Audio.
+            active.mixer = ChannelMixer(sink)
+            active.handles = [
+                self._audio.open(device, functools.partial(active.mixer.push, channel))
+                for channel, device in enumerate(devices)
+            ]
         return status
+
+    def _require_device(self, device_kind: DeviceKind) -> AudioDevice:
+        device = self._audio.default_device(device_kind)
+        if device is None:
+            raise CaptureError(
+                "No microphone was found."
+                if device_kind is DeviceKind.INPUT
+                else "No output device was found to capture System Audio from."
+            )
+        return device
 
     def live_captions(self) -> LiveCaptions:
         with self._live_lock:
@@ -332,10 +384,14 @@ class TranscriberCore:
             active = self._capture
             if active is None or self._capture_status.state is not CaptureState.CAPTURING:
                 raise CaptureError("No Capture is running.")
-            if active.handle is not None:
-                active.handle.stop()
+            for handle in active.handles:
+                handle.stop()
+            if active.mixer is not None:
+                active.mixer.flush()
             active.recorder.close()
-            status = CaptureStatus(CaptureState.FINALISING, active.title, active.started_at, active.recorder.path)
+            status = CaptureStatus(
+                CaptureState.FINALISING, active.title, active.started_at, active.recorder.path, kind=active.kind
+            )
             self._capture_status = status
         stream, active.stream = active.stream, None
         if stream is not None:
@@ -345,13 +401,14 @@ class TranscriberCore:
                 pass
         self._emit(CaptureChanged(status))
         try:
-            result = self._gateway.transcribe(active.recorder.path)
+            result = self._gateway.transcribe(active.recorder.path, multichannel=active.channels > 1)
         except TranscriptionError:
             provisional = self._save_provisional(active)
             with self._capture_lock:
                 self._capture = None
                 self._capture_status = CaptureStatus(
-                    CaptureState.NEEDS_RETRY, active.title, active.started_at, active.recorder.path, provisional.id
+                    CaptureState.NEEDS_RETRY, active.title, active.started_at, active.recorder.path,
+                    provisional.id, kind=active.kind,
                 )
             self._emit(CaptureChanged(self._capture_status))
             return provisional
@@ -375,17 +432,20 @@ class TranscriberCore:
         )
         recording.unlink(missing_ok=True)
         with self._capture_lock:
-            self._capture_status = CaptureStatus(CaptureState.COMPLETE, title, started_at, transcript_id=transcript.id)
+            self._capture_status = CaptureStatus(
+                CaptureState.COMPLETE, title, started_at, transcript_id=transcript.id, kind=kind
+            )
         self._emit(CaptureChanged(self._capture_status))
         return transcript
 
     def _save_provisional(self, active: _ActiveCapture) -> Transcript:
         """Keep what the Live Captions heard as a provisional Transcript, so the user has something to read."""
         live = self.live_captions()
-        paragraphs = [
-            Paragraph(start=c.start, end=c.start, speaker=c.speaker or 0, text=c.text) for c in live.final
+        heard = [
+            Paragraph(start=c.start, end=c.start, speaker=c.speaker or 0, text=c.text, channel=c.channel)
+            for c in live.final
         ]
-        speakers = sorted({p.speaker for p in paragraphs})
+        paragraphs, speaker_names = attribute_speakers(active.kind, heard)
         transcript = Transcript(
             id=active.id,
             title=active.title,
@@ -394,7 +454,7 @@ class TranscriberCore:
             source_kind=active.kind,
             source_path=None,
             paragraphs=paragraphs,
-            speaker_names={s: default_speaker_name(s) for s in speakers},
+            speaker_names=speaker_names,
             status=TranscriptStatus.PROVISIONAL,
             rendering_path=None,
             recording_path=active.recorder.path,
@@ -416,11 +476,12 @@ class TranscriberCore:
             )
         self._emit(CaptureChanged(self._capture_status))
         try:
-            result = self._gateway.transcribe(recording)
+            result = self._gateway.transcribe(recording, multichannel=_wav_channels(recording) > 1)
         except TranscriptionError:
             with self._capture_lock:
                 self._capture_status = CaptureStatus(
-                    CaptureState.NEEDS_RETRY, provisional.title, provisional.created, recording, provisional.id
+                    CaptureState.NEEDS_RETRY, provisional.title, provisional.created, recording, provisional.id,
+                    kind=provisional.source_kind,
                 )
             self._emit(CaptureChanged(self._capture_status))
             return provisional
@@ -478,7 +539,7 @@ class TranscriberCore:
         created: datetime | None = None,
     ) -> Transcript:
         """Turn a gateway result into a persisted Transcript with its Rendering written."""
-        speakers = sorted({p.speaker for p in result.paragraphs})
+        paragraphs, speaker_names = attribute_speakers(kind, result.paragraphs)
         transcript = Transcript(
             id=transcript_id,
             title=title,
@@ -486,8 +547,8 @@ class TranscriberCore:
             duration=result.duration,
             source_kind=kind,
             source_path=source_path,
-            paragraphs=list(result.paragraphs),
-            speaker_names={s: default_speaker_name(s) for s in speakers},
+            paragraphs=paragraphs,
+            speaker_names=speaker_names,
             rendering_path=rendering_path,
         )
         rendering_path.parent.mkdir(parents=True, exist_ok=True)

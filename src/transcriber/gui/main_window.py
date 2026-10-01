@@ -111,8 +111,9 @@ class MainWindow(QMainWindow):
 
         # Capture controls
         self.source_kind = QComboBox()
-        self.source_kind.addItem(SourceKind.MICROPHONE.label, SourceKind.MICROPHONE)
-        self.source_kind.addItem(SourceKind.SYSTEM_AUDIO.label, SourceKind.SYSTEM_AUDIO)
+        for kind in (SourceKind.MEETING, SourceKind.MICROPHONE, SourceKind.SYSTEM_AUDIO):
+            self.source_kind.addItem(kind.label, kind)
+        self.source_kind.setCurrentIndex(0)  # Meeting is the default kind of Capture
         self.title_edit = QLineEdit()
         self.title_edit.setPlaceholderText("Title (optional)")
         self.capture_button = QPushButton("Start capture")
@@ -252,10 +253,11 @@ class MainWindow(QMainWindow):
                 self._tick()
 
     def _show_captions(self, live: LiveCaptions) -> None:
-        lines = [f"<b>{self._caption_speaker(c.speaker)}:</b> {html_escape(c.text)}" for c in live.final]
+        meeting = self._core.capture_status().kind is SourceKind.MEETING
+        lines = [f"<b>{self._caption_speaker(c, meeting)}:</b> {html_escape(c.text)}" for c in live.final]
         if live.provisional is not None:
             lines.append(
-                f'<span style="color: gray;"><i>{self._caption_speaker(live.provisional.speaker)}: '
+                f'<span style="color: gray;"><i>{self._caption_speaker(live.provisional, meeting)}: '
                 f"{html_escape(live.provisional.text)}</i></span>"
             )
         if live.reconnecting:
@@ -264,8 +266,13 @@ class MainWindow(QMainWindow):
         self.captions_view.verticalScrollBar().setValue(self.captions_view.verticalScrollBar().maximum())
 
     @staticmethod
-    def _caption_speaker(speaker: int | None) -> str:
-        return "Speaker" if speaker is None else f"Speaker {speaker + 1}"
+    def _caption_speaker(caption, meeting: bool) -> str:
+        """Live Captions label: in a Meeting the Microphone channel is You and System Audio speakers are numbered."""
+        if meeting and caption.channel == 0:
+            return "You"
+        if caption.speaker is None:
+            return "Speaker"
+        return f"Speaker {caption.speaker + 1}"
 
     @Slot(object)
     def _on_capture_ready(self, transcript: Transcript) -> None:

@@ -62,12 +62,14 @@ class FakeTranscriptionGateway:
         self.fail_for: dict[Path, Exception] = {}
         self.requests: list[Path] = []
         self.request_bytes: list[bytes] = []
+        self.multichannel_requests: list[bool] = []
         self.streams: list[FakeLiveStream] = []
         self.fail_open = 0
 
-    def transcribe(self, audio: Path) -> TranscriptionResult:
+    def transcribe(self, audio: Path, multichannel: bool = False) -> TranscriptionResult:
         self.requests.append(audio)
         self.request_bytes.append(audio.read_bytes())
+        self.multichannel_requests.append(multichannel)
         if audio in self.fail_for:
             raise self.fail_for[audio]
         if self.fail_with is not None:
@@ -97,7 +99,8 @@ class FakeAudioCapture:
     """Plays a 16 kHz mono WAV as if it were the device.
 
     With `auto_play` every chunk is delivered before `open` returns; without it the test feeds
-    chunks by hand with `deliver`, so it can interleave audio with other events.
+    chunks by hand with `deliver`, so it can interleave audio with other events. Several devices
+    can be open at once (a Meeting Capture opens two); `deliver` picks one by id.
     """
 
     def __init__(self, wav: Path = FIXTURES / "hello.wav", chunk_frames: int = 1600, auto_play: bool = True) -> None:
@@ -110,7 +113,7 @@ class FakeAudioCapture:
         ]
         self.opened: list[AudioDevice] = []
         self.stopped = 0
-        self._on_chunk: Callable[[bytes], None] | None = None
+        self._sinks: dict[str, Callable[[bytes], None]] = {}
 
     def list_devices(self) -> list[AudioDevice]:
         return list(self.devices)
@@ -120,7 +123,7 @@ class FakeAudioCapture:
 
     def open(self, device: AudioDevice, on_chunk: Callable[[bytes], None]) -> CaptureHandle:
         self.opened.append(device)
-        self._on_chunk = on_chunk
+        self._sinks[device.id] = on_chunk
         if self.auto_play:
             for i in range(0, len(self.frames), self.chunk_bytes):
                 on_chunk(self.frames[i : i + self.chunk_bytes])
@@ -129,13 +132,16 @@ class FakeAudioCapture:
         class _Handle:
             def stop(self) -> None:
                 fake.stopped += 1
-                fake._on_chunk = None
+                fake._sinks.pop(device.id, None)
 
         return _Handle()
 
-    def deliver(self, chunk: bytes) -> None:
-        assert self._on_chunk is not None, "no capture is open"
-        self._on_chunk(chunk)
+    def deliver(self, chunk: bytes, device_id: str | None = None) -> None:
+        if device_id is None:
+            assert len(self._sinks) == 1, "several devices are open; say which one"
+            device_id = next(iter(self._sinks))
+        assert device_id in self._sinks, f"{device_id} is not open"
+        self._sinks[device_id](chunk)
 
 
 __all__ = [

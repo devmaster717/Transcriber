@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .gateway import Caption
+from .model import SourceKind
 
 SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2  # bytes: 16-bit linear PCM
@@ -70,6 +71,7 @@ class CaptureStatus:
     started_at: datetime | None = None
     recording_path: Path | None = None
     transcript_id: str | None = None
+    kind: SourceKind | None = None
 
 
 @dataclass(frozen=True)

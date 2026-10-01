@@ -19,7 +19,7 @@ def test_rendering_defaults_are_stored_and_applied_to_new_renderings(core, gatew
     transcript = core.transcribe_file(audio_file)
 
     assert transcript.rendering_path.read_text(encoding="utf-8") == PLAIN
-    fresh = TranscriberCore(gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir, clock=clock)
+    fresh = TranscriberCore(gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir, clock=clock, env={"DEEPGRAM_API_KEY": "test-key"})
     assert fresh.settings().include_timestamps is False
     assert fresh.settings().include_speaker_labels is False
     assert fresh.settings().custom_vocabulary == []

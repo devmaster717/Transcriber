@@ -7,6 +7,7 @@ as fixed by the spec. The core never sees SDK types; everything is mapped to dom
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from websockets.exceptions import InvalidStatus
 from .core.capture import SAMPLE_RATE
 from .core.gateway import (
     Caption,
+    MissingKeyError,
     OnCaption,
     OnStreamError,
     RejectedKeyError,
@@ -116,9 +118,21 @@ class _DeepgramStream:
         self._thread.join(timeout=3.0)
 
 
+KeyProvider = Callable[[], str | None]
+
+
 class DeepgramGateway:
-    def __init__(self, api_key: str) -> None:
-        self._client = DeepgramClient(api_key=api_key)
+    """Reads the API key through `key_provider` at request time, so a key saved in Settings takes effect at once."""
+
+    def __init__(self, key_provider: KeyProvider | str) -> None:
+        self._key_provider: KeyProvider = (lambda: key_provider) if isinstance(key_provider, str) else key_provider
+
+    @property
+    def _client(self) -> DeepgramClient:
+        key = self._key_provider()
+        if not key:
+            raise MissingKeyError("No Deepgram API key. Enter one in Settings.")
+        return DeepgramClient(api_key=key)
 
     def open_stream(self, on_caption: OnCaption, on_error: OnStreamError, channels: int = 1) -> _DeepgramStream:
         options = dict(LIVE_OPTIONS, channels=channels)

@@ -24,8 +24,16 @@ class TranscriptionError(Exception):
         self.message = message
 
 
-class RejectedKeyError(TranscriptionError):
+class KeyProblem(TranscriptionError):
+    """Something about the API key stops work: the settings screen is the fix."""
+
+
+class RejectedKeyError(KeyProblem):
     """Deepgram rejected the API key (401 or 403)."""
+
+
+class MissingKeyError(KeyProblem):
+    """No API key is configured anywhere."""
 
 
 @dataclass(frozen=True)

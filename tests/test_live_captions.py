@@ -47,7 +47,7 @@ def test_a_dropped_stream_is_reopened_with_backoff_while_the_recording_continues
     sleeps: list[float] = []
     core = TranscriberCore(
         gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir,
-        clock=clock, sleeper=sleeps.append,
+        clock=clock, sleeper=sleeps.append, env={"DEEPGRAM_API_KEY": "test-key"},
     )
     seen: list[LiveCaptions] = []
     core.subscribe(lambda e: seen.append(e.live) if isinstance(e, CaptionsChanged) else None)
@@ -77,7 +77,7 @@ def test_a_stream_that_cannot_open_at_start_is_retried_and_the_capture_still_rec
     sleeps: list[float] = []
     core = TranscriberCore(
         gateway=gateway, audio_capture=audio, data_dir=data_dir, transcripts_dir=transcripts_dir,
-        clock=clock, sleeper=sleeps.append,
+        clock=clock, sleeper=sleeps.append, env={"DEEPGRAM_API_KEY": "test-key"},
     )
     gateway.fail_open = 1
 
